@@ -24,7 +24,11 @@ from agent.schema import (
     Message,
 )
 from api_view.agent_loader import agent_loader
-from agent.langfuse_trace import attach as attach_langfuse, flush as flush_langfuse
+from agent.langfuse_trace import (
+    attach as attach_langfuse,
+    patch_trace_io as patch_langfuse_trace_io,
+    flush as flush_langfuse,
+)
 
 
 # 创建路由
@@ -342,8 +346,16 @@ async def stream_chat_response(
     usage_collector = TurnUsageCollector()
     config.setdefault("callbacks", []).append(usage_collector)
 
-    # Langfuse 追踪：没配 .env.langfuse 时自动跳过，对原有行为零影响
-    attach_langfuse(config, thread_id=thread_id, user_id=user_id)
+    # Langfuse 追踪：没配 .env.langfuse 时自动跳过，对原有行为零影响。
+    # trace 名字用「问题前 20 字」，否则列表里所有对话都叫 LangGraph，分不清哪轮。
+    try:
+        label = (message or ("恢复中断" if resume_data is not None else "未命名"))[:20]
+        trace_name = f"erp-agent · {label}"
+        config["run_name"] = trace_name
+        attach_langfuse(config, thread_id=thread_id, user_id=user_id,
+                        trace_name=trace_name, tags=["local", "erp-agent"])
+    except Exception:  # noqa: BLE001 —— 追踪/起名失败绝不能影响对话
+        pass
 
     def usage_sse() -> str:
         """本轮用量事件（在 done / interrupt 之前发，前端好把数字挂到这条消息上）。"""
@@ -703,6 +715,18 @@ async def stream_chat_response(
         })
 
     finally:
+        # trace 的 input/output 覆盖成「用户问题 / 最终回答」，别让界面显示整坨 messages JSON。
+        # 必须放后台线程：要等 trace 异步入库、再 upsert，不能拖慢响应。
+        try:
+            import threading
+
+            threading.Thread(
+                target=patch_langfuse_trace_io,
+                args=(thread_id, message or "", collected_content),
+                daemon=True,
+            ).start()
+        except Exception:  # noqa: BLE001
+            pass
         # 追踪是异步批量上报的，请求结束前必须 flush，否则 trace 可能还没发出去
         flush_langfuse()
 

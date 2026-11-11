@@ -73,6 +73,10 @@ def setup_sandbox(config, sandbox_id=None, image=None) -> OpenSandboxBackend:
     # 播种基础文件（AGENTS.md、Skills）
     _seed_files(backend)
 
+    # 播种完立刻写上「同步标记」：这样新沙箱的第一轮就能走快路径，
+    # 不必让 SkillsSyncMiddleware 再对每个文件做 2 次往返探测（实测省 20 秒）。
+    _write_sync_marker(backend)
+
     # 创建 Python venv + 预装第三方依赖
     _create_venv(backend)
 
@@ -100,6 +104,22 @@ def _ensure_dirs(backend: OpenSandboxBackend) -> None:
     """预创建 skills 运行所需的目录，避免 FileNotFoundError。"""
     for d in _SKILL_DIRS:
         backend.execute(f"mkdir -p {d}")
+
+
+def _write_sync_marker(backend: OpenSandboxBackend) -> None:
+    """播种后写入技能同步指纹，供 SkillsSyncMiddleware 的快路径判断。
+
+    失败不影响主流程：标记缺失时中间件会退回"完整同步"，只是慢一点。
+    """
+    try:
+        from agent.middlewares.skills_sync import SYNC_MARKER, local_skills_fingerprint
+
+        fingerprint = local_skills_fingerprint()
+        if fingerprint:
+            backend.upload_files([(SYNC_MARKER, fingerprint.encode("utf-8"))])
+            print(f"[INFO] 技能同步标记已写入：{fingerprint[:12]}…")
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARNING] 技能同步标记写入失败（不影响运行）: {e}")
 
 
 # PyPI 镜像，沙箱内加速。

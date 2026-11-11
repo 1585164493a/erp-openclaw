@@ -18,7 +18,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -54,6 +56,24 @@ WRITE_TOOLS = {                # 写工具：调了却没有停下来等人审�
 }
 # 中断/审批相关的 observation 名字里通常带这些词
 HITL_HINTS = ("hitl", "interrupt", "审批", "中断")
+
+# ============ 答案质量断言（2026-11-11 从一条真实 bad case 提炼）============
+# 那次用户问「帮我查一下都有哪些sku」，模型给了统计分析和一条虚构的报告路径。
+LIST_INTENT = re.compile(r"(有哪些|列出|清单|明细|多少(个|条|种)|都有哪些)")
+RECORD_CODE = re.compile(r"\b[A-Z]{2,}[A-Z0-9]*-\d{2,}\b")   # 形如 HFS-750-01 / SKU-001
+REPORT_PATH = re.compile(r"/analysis/report_[A-Za-z0-9_\-]+\.md")
+MIN_RECORDS = 3      # 问清单时，答案里至少要出现的记录编号个数
+
+
+def _score_id(trace_id: str, name: str) -> str:
+    """幂等键 = trace_id + 分名，转成合法 UUID。
+
+    两个实测结论（2026-11-11 在你实例上验过）：
+    ① id 必须是**合法 UUID/cuid**。我一开始用 "trace:name" 这种带冒号的字符串，
+       服务端直接忽略 → 退化成"新增"，分数越堆越多（同 trace 同名堆到 8 条）。
+    ② 合法 UUID 重复 POST 是**覆盖**：传同一个 id 两次，库里只有 1 条，value 被更新。
+    """
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{trace_id}:{name}"))
 
 
 def lf_get(path: str, params: dict | None = None) -> dict:
@@ -162,12 +182,26 @@ def extract_facts(trace: dict, observations: list[dict], existing_scores: list[d
         prev_sig = sig
         best = max(best, run)
 
+    # 写文件实际落地的路径（用于判断答案里报的路径是不是编的）
+    written_paths: set[str] = set()
+    for o in observations:
+        if (o.get("type") or "").upper() != "TOOL":
+            continue
+        if (o.get("name") or "") not in {"write_file", "edit_file"}:
+            continue
+        inp = o.get("input")
+        if isinstance(inp, dict):
+            p = inp.get("file_path") or inp.get("path")
+            if isinstance(p, str):
+                written_paths.add(p)
+
     return {
         "trace_id": trace.get("id"),
         "input": trace.get("input"),
         "output": trace.get("output"),
         "question_text": _extract_question(trace.get("input")),
         "answer_text": _extract_answer(trace.get("output")),
+        "written_paths": written_paths,
         "latency": trace.get("latency") or 0.0,
         "tools": tool_names,
         "tool_repeat": best,
@@ -179,11 +213,16 @@ def extract_facts(trace: dict, observations: list[dict], existing_scores: list[d
 
 
 def _fetch_scores(trace_id: str) -> list[dict]:
-    """trace 列表里的 scores 只是 id 字符串，要点踩得单独查一次。"""
+    """取这条 trace 上的分数。
+
+    ⚠️ 实测 2026-11-11：`/api/public/scores?traceId=xxx` 的过滤参数**不生效**
+    （返回的是全项目最近分数），只能先拉一批再在本地按 traceId 过滤。
+    """
     try:
-        return lf_get("/api/public/scores", {"traceId": trace_id, "limit": 50}).get("data") or []
+        data = lf_get("/api/public/scores", {"limit": 100}).get("data") or []
     except Exception:  # noqa: BLE001
         return []
+    return [s for s in data if isinstance(s, dict) and s.get("traceId") == trace_id]
 
 
 def _user_feedback(scores: list[dict]) -> float | None:
@@ -208,8 +247,9 @@ def run_rules(f: dict) -> tuple[list[dict], list[str]]:
     reasons: list[str] = []
 
     def add(name: str, value: Any, dtype: str, comment: str = "") -> None:
-        scores.append({"name": name, "value": value, "dataType": dtype, "comment": comment,
-                       "traceId": f["trace_id"]})
+        # 幂等键：同一条 trace + 同一个分名 -> 同一个 UUID，重复写会覆盖而不是新增
+        scores.append({"id": _score_id(f["trace_id"], name), "name": name, "value": value,
+                       "dataType": dtype, "comment": comment, "traceId": f["trace_id"]})
 
     # R1 报错：出现 ERROR 级 observation。硬约束，出现即告警
     if f["errors"]:
@@ -246,6 +286,25 @@ def run_rules(f: dict) -> tuple[list[dict], list[str]]:
         reasons.append("empty_output")
     else:
         add("empty_output", 0, "BOOLEAN")
+
+    # R6 答非所问：用户要清单，答案里却没有具体记录
+    answer = f["answer_text"]
+    records = set(RECORD_CODE.findall(answer))
+    if LIST_INTENT.search(f["question_text"]) and len(records) < MIN_RECORDS:
+        add("answer_has_records", 1, "BOOLEAN",
+            f"问清单但只有 {len(records)} 个记录编号（要求 ≥{MIN_RECORDS}）")
+        reasons.append("no_records")
+    else:
+        add("answer_has_records", 0, "BOOLEAN")
+
+    # R7 幻觉路径：答案里报的报告路径，trace 里并没有真的写过
+    claimed = set(REPORT_PATH.findall(answer))
+    fake = {p for p in claimed if p not in (f.get("written_paths") or set())}
+    if fake:
+        add("hallucinated_path", 1, "BOOLEAN", f"未实际写入：{', '.join(sorted(fake))[:80]}")
+        reasons.append("hallucinated_path")
+    else:
+        add("hallucinated_path", 0, "BOOLEAN")
 
     return scores, reasons
 
@@ -298,6 +357,33 @@ def ensure_bad_case_dataset() -> None:
         print(f"  [warn] 建数据集返回 {code}")
 
 
+def _existing_quality(scores: list[dict], name: str) -> float | None:
+    """读 Langfuse judge 已经写在这条 trace 上的质量分（plan B：judge 在平台跑，脚本只读）。"""
+    for s in scores:
+        if isinstance(s, dict) and (s.get("name") or "") == name:
+            for key in ("value", "stringValue"):
+                try:
+                    return float(s.get(key))
+                except (TypeError, ValueError):
+                    continue
+    return None
+
+
+def existing_bad_trace_ids() -> set[str]:
+    """bad-cases 里已有的 traceId —— 回流也要幂等，别每次都新增一条。"""
+    try:
+        data = lf_get("/api/public/dataset-items",
+                      {"datasetName": BAD_CASE_DATASET, "limit": 100}).get("data") or []
+    except Exception:  # noqa: BLE001
+        return set()
+    out: set[str] = set()
+    for it in data:
+        tid = (it.get("metadata") or {}).get("traceId")
+        if tid:
+            out.add(str(tid))
+    return out
+
+
 def push_bad_case(f: dict, reasons: list[str], quality: float | None, judge_reason: str) -> int:
     body = {
         "datasetName": BAD_CASE_DATASET,
@@ -322,11 +408,17 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=20, help="看最近多少条 trace")
     ap.add_argument("--since-minutes", type=int, default=24 * 60, help="只看多久以内的")
-    ap.add_argument("--no-judge", action="store_true", help="只跑硬规则，不调大模型")
+    ap.add_argument("--judge", action="store_true",
+                    help="自己调大模型打分（默认不调：优先读 Langfuse LLM-as-a-Judge 写的分）")
+    ap.add_argument("--no-judge", action="store_true", help="（兼容旧用法，等价于不加 --judge）")
+    ap.add_argument("--quality-score-name", default="quality",
+                    help="Langfuse judge 写回来的分数名，脚本直接读它用于 bad 判定")
     ap.add_argument("--dry-run", action="store_true", help="只打印，不写分数不回流")
     ap.add_argument("--force", action="store_true", help="已经评过的 trace 也重新评（默认跳过，避免分数重复堆积）")
     ap.add_argument("--environment", default="default",
                     help="只评这个 environment 的 trace（实验/SDK 自测产生的 trace 通常不是 default）")
+    ap.add_argument("--skip-names", default="connectivity-check",
+                    help="按 trace 名排除测试流量，逗号分隔")
     args = ap.parse_args()
 
     if not LF_HOST or not LF_AUTH[0]:
@@ -338,6 +430,10 @@ def main() -> int:
     traces = [t for t in traces if _ts_after(t.get("timestamp"), cutoff)]
     if args.environment:
         traces = [t for t in traces if (t.get("environment") or "default") == args.environment]
+    # 排除测试流量：连通性自测、SDK 冒烟测试的 trace 不该进 bad-cases
+    skip_names = {n.strip().lower() for n in (args.skip_names or "").split(",") if n.strip()}
+    if skip_names:
+        traces = [t for t in traces if (t.get("name") or "").lower() not in skip_names]
 
     print(f"待评 trace：{len(traces)} 条（limit={args.limit}, since={args.since_minutes}min）\n")
     if not traces:
@@ -345,6 +441,7 @@ def main() -> int:
 
     if not args.dry_run:
         ensure_bad_case_dataset()
+    bad_seen = existing_bad_trace_ids()
 
     pushed = 0
     skipped = 0
@@ -355,19 +452,29 @@ def main() -> int:
         seen = {s.get("name") for s in existing if isinstance(s, dict)}
         if not args.force and (seen & our_scores):
             skipped += 1
+            print(f"skip {str(t.get('id'))[:8]} | 已评过（--force 可重评）")
             continue
         obs = fetch_observations(t.get("id"))
         f = extract_facts(t, obs, existing)
+
+        # 质量分：优先读 Langfuse judge 写的（plan B：judge 搬进 Langfuse，脚本只读结果）
+        quality, jreason = _existing_quality(existing, args.quality_score_name), ""
+        if quality is not None:
+            jreason = f"来自 Langfuse judge（{args.quality_score_name}）"
+        elif args.judge and f["question_text"] and f["answer_text"]:
+            quality, jreason = judge_quality(f["question_text"][:1500], f["answer_text"][:2000])
+
         scores, reasons = run_rules(f)
 
-        quality, jreason = (None, "")
-        if not args.no_judge and f["question_text"] and f["answer_text"]:
-            quality, jreason = judge_quality(f["question_text"][:1500], f["answer_text"][:2000])
-            if quality is not None:
-                scores.append({"name": "quality_score", "value": quality, "dataType": "NUMERIC",
-                               "comment": jreason, "traceId": f["trace_id"]})
-                if quality < MIN_QUALITY:
-                    reasons.append(f"quality<{MIN_QUALITY}")
+        if quality is not None:
+            # 只写 trace 级的 quality_score：名字和平台 judge 的 quality 区分开。
+            # ⚠️ 别再往 trace 级写同名的 quality —— 会和 judge 的 observation 级同名冲突，
+            #    表格列取不到值（实测 2026-11-11，踩过一次）。
+            scores.append({"id": _score_id(f["trace_id"], "quality_score"), "name": "quality_score",
+                           "value": quality, "dataType": "NUMERIC",
+                           "comment": jreason, "traceId": f["trace_id"]})
+            if quality < MIN_QUALITY:
+                reasons.append(f"quality<{MIN_QUALITY}")
 
         # 点踩也算 bad
         if f["user_feedback"] is not None and f["user_feedback"] <= 0:
@@ -384,9 +491,13 @@ def main() -> int:
             lf_post("/api/public/scores", s)
 
         if reasons:
-            code = push_bad_case(f, reasons, quality, jreason)
-            pushed += 1
-            print(f"       → bad-cases dataset: {code}")
+            if f["trace_id"] in bad_seen:
+                print("       → 已在 bad-cases，跳过")
+            else:
+                code = push_bad_case(f, reasons, quality, jreason)
+                bad_seen.add(f["trace_id"])
+                pushed += 1
+                print(f"       → bad-cases dataset: {code}")
 
     if args.dry_run:
         print("\n--dry-run：没有写任何分数，也没有回流。")
