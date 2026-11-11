@@ -201,15 +201,29 @@ def run_mcp():
 
 
 def run_backend():
-    """启动 Agent 对话后端（uvicorn api_view.web_main:app，端口 8091）。"""
+    """启动 Agent 对话后端（uvicorn api_view.web_main:app，端口 8091）。
+
+    ⚠️ 2026-11-10：默认**不再**带 --reload。
+
+    为什么（实测踩到）：uvicorn 的 WatchFiles 盯的是整个工作目录 ——
+    任何文件变动都会触发重载，**包括 src/test/ 下的评测脚本**。
+    而重载会丢掉后端的进程内状态：
+        · `precompute_agent_context()` 预计算的 MCP 工具集
+        · 中间件链、沙箱注册表、SKILLS 命名空间
+    表现就是「正在跑 eval_routing.py，顺手改了 online_eval.py →
+    后端 Reloading → 评测中途断线」，日志里能看到
+    `WatchFiles detected changes ... Reloading...`。
+
+    需要热重载时显式开：设环境变量 ERP_BACKEND_RELOAD=1。
+    这样"改代码自动生效"变成主动选择，而不是默认副作用。
+    """
     project_root, env = _base_env()
-    return _start(
-        "Backend",
-        [_project_python(), "-m", "uvicorn", "api_view.web_main:app",
-         "--reload", "--host", "0.0.0.0", "--port", "8091"],
-        env,
-        cwd=project_root,
-    )
+    argv = [_project_python(), "-m", "uvicorn", "api_view.web_main:app",
+            "--host", "0.0.0.0", "--port", "8091"]
+    if os.getenv("ERP_BACKEND_RELOAD") == "1":
+        argv.insert(4, "--reload")   # 放在 app 之后、--host 之前
+        print("[System] Backend 启动：--reload 已开启（ERP_BACKEND_RELOAD=1）")
+    return _start("Backend", argv, env, cwd=project_root)
 
 
 def run_frontend():
