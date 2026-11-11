@@ -28,6 +28,7 @@ from agent.langfuse_trace import (
     attach as attach_langfuse,
     patch_trace_io as patch_langfuse_trace_io,
     flush as flush_langfuse,
+    notify_interrupts as notify_langfuse_interrupts,
 )
 
 
@@ -352,8 +353,12 @@ async def stream_chat_response(
         label = (message or ("恢复中断" if resume_data is not None else "未命名"))[:20]
         trace_name = f"erp-agent · {label}"
         config["run_name"] = trace_name
+        trace_tags = ["local", "erp-agent"]
+        # 续跑（resume）会新开一条 trace，审批发生在上一轮 —— 打个标签让评测能豁免
+        if resume_data is not None:
+            trace_tags.append("resume")
         attach_langfuse(config, thread_id=thread_id, user_id=user_id,
-                        trace_name=trace_name, tags=["local", "erp-agent"])
+                        trace_name=trace_name, tags=trace_tags)
     except Exception:  # noqa: BLE001 —— 追踪/起名失败绝不能影响对话
         pass
 
@@ -422,11 +427,23 @@ async def stream_chat_response(
                     "count": len(interrupts),
                 })
 
+                pending_interrupts = []
                 for interrupt in interrupts:
                     interrupt_value = interrupt.value
 
                     if "action_requests" in interrupt_value:
                         # ---- 第 2 层：HITL 审批中断（interrupt_on 配置）----
+                        _acts = interrupt_value["action_requests"]
+                        _first = _acts[0] if _acts else {}
+                        _cfg = (interrupt_value.get("review_configs") or [{}])[0]
+                        pending_interrupts.append({
+                            "id": getattr(interrupt, "id", None),
+                            "kind": "hitl_approval",
+                            "tool": _first.get("name") or "",
+                            "args": _first.get("args") or {},
+                            "allowed": _cfg.get("allowed_decisions") or [],
+                            "source": "main",
+                        })
                         yield usage_sse()
                         yield create_sse_message({
                             "type": "interrupt",
@@ -441,6 +458,14 @@ async def stream_chat_response(
 
                     elif interrupt_value.get("type") == "order_info_request":
                         # ---- 第 1 层：数据补充中断（request_order_info 工具）----
+                        pending_interrupts.append({
+                            "id": getattr(interrupt, "id", None),
+                            "kind": "order_info_supplement",
+                            "tool": "request_order_info",
+                            "args": {"missing_fields": interrupt_value.get("missing_fields")},
+                            "allowed": [],
+                            "source": "main",
+                        })
                         yield usage_sse()
                         yield create_sse_message({
                             "type": "interrupt",
@@ -462,6 +487,12 @@ async def stream_chat_response(
                             "interrupt_value": str(interrupt_value)[:2000],
                             "thread_id": thread_id,
                         })
+
+                # 把本轮中断登记下来，等 trace 落库后写成 EVENT（一次中断一条，幂等）
+                try:
+                    notify_langfuse_interrupts(thread_id, pending_interrupts)
+                except Exception:  # noqa: BLE001
+                    pass
 
                 # 兜底：将所有 calling 状态的工具标记为 done
                 for dm in display_messages:

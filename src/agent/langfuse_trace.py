@@ -79,6 +79,50 @@ def _apply_env() -> None:
 _apply_env()
 
 
+class _ReadableError(Exception):
+    """把「不可读的异常 repr」换成人类可读的中断描述。
+
+    背景（2026-11-12 实测）：LangGraph 的 HITL 中断是抛异常实现的，那些异常对象
+    没实现 __repr__/__str__，Langfuse 直接把 str(exc) 存成 statusMessage，于是界面上
+    只看到 `<object object at 0x...>` 或 `(<object …>, <Task cancelled …>)`，
+    完全看不出「这是等待人工审批」。这里在错误回调里包一层再交给 Langfuse。
+    """
+
+    def __init__(self, original: BaseException) -> None:
+        raw = str(original)
+        if "object at 0x" in raw or "Task cancelled" in raw or "cancel scope" in raw:
+            text = "HITL 中断：等待人工审批（LangGraph interrupt，属预期暂停）"
+        else:
+            text = raw.strip() or original.__class__.__name__
+        super().__init__(text)
+        self.original = original
+
+
+def _wrap(handler_cls):
+    """给 Langfuse 回调做一层子类：错误回调里把异常换成 _ReadableError。"""
+
+    class _ReadableCallback(handler_cls):  # type: ignore[misc, valid-type]
+        def _pass(self, method: str, error: BaseException, *args, **kwargs):
+            fn = getattr(super(), method, None)
+            if fn is None:
+                return None
+            return fn(_ReadableError(error), *args, **kwargs)
+
+        def on_chain_error(self, error, *args, **kwargs):
+            return self._pass("on_chain_error", error, *args, **kwargs)
+
+        def on_tool_error(self, error, *args, **kwargs):
+            return self._pass("on_tool_error", error, *args, **kwargs)
+
+        def on_llm_error(self, error, *args, **kwargs):
+            return self._pass("on_llm_error", error, *args, **kwargs)
+
+        def on_agent_error(self, error, *args, **kwargs):
+            return self._pass("on_agent_error", error, *args, **kwargs)
+
+    return _ReadableCallback
+
+
 def get_callback() -> Any | None:
     """返回一个 LangChain 回调 handler；未配置或导入失败时返回 None。"""
     if not is_enabled():
@@ -88,7 +132,7 @@ def get_callback() -> Any | None:
     try:
         from langfuse.langchain import CallbackHandler
 
-        return CallbackHandler()
+        return _wrap(CallbackHandler)()
     except Exception:  # noqa: BLE001 —— 追踪失败绝不能影响主流程
         return None
 
@@ -170,6 +214,20 @@ def patch_trace_io(thread_id: str, question: str, answer: str,
                 if not data:
                     continue
                 t = data[0]
+                # 这一轮是否走到人工审批（HITL）。命中就给 trace 打 tag，
+                # 供 Langfuse 的 Rule 用 `Tags 不含 hitl` 把写操作 trace 排除在 judge 之外。
+                tags = list(t.get("tags") or [])
+                try:
+                    ro = c.get(f"{host}/api/public/observations",
+                               params={"traceId": t.get("id"), "limit": 100}, auth=auth)
+                    names = " ".join((o.get("name") or "").lower()
+                                     for o in ((ro.json() or {}).get("data") or []))
+                    if any(h in names for h in ("humanintheloop", "interrupt", "审批", "中断")):
+                        if "hitl" not in tags:
+                            tags.append("hitl")
+                except Exception:  # noqa: BLE001
+                    pass
+
                 event = {
                     "id": str(uuid.uuid4()),
                     "type": "trace-create",
@@ -179,18 +237,60 @@ def patch_trace_io(thread_id: str, question: str, answer: str,
                         "name": t.get("name"),
                         "sessionId": t.get("sessionId"),
                         "userId": t.get("userId"),
-                        "tags": t.get("tags") or [],
+                        "tags": tags,
                         "metadata": t.get("metadata") or {},
                         "input": question or "",
                         "output": answer or "",
                     },
                 }
-                resp = c.post(f"{host}/api/public/ingestion", json={"batch": [event]}, auth=auth)
+                # 中断事件化：一次中断一条 EVENT，用 interrupt.id 做幂等键
+                batch = [event]
+                for it in _pop_interrupts(thread_id):
+                    iid = str(it.get("id") or uuid.uuid4())
+                    batch.append({
+                        "id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"interrupt:{iid}")),
+                        "type": "event-create",
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+                        "body": {
+                            "id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"hitl-event:{iid}")),
+                            "traceId": t.get("id"),
+                            "name": "hitl_interrupt",
+                            "startTime": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+                            "metadata": {
+                                "interrupt_id": iid,
+                                "kind": it.get("kind") or "unknown",
+                                "tool": it.get("tool") or "",
+                                "args": it.get("args") or {},
+                                "allowed_decisions": it.get("allowed") or [],
+                                "source": it.get("source") or "",
+                            },
+                        },
+                    })
+
+                resp = c.post(f"{host}/api/public/ingestion", json={"batch": batch}, auth=auth)
                 if resp.status_code in (200, 207):
                     return True
         except Exception:  # noqa: BLE001
             continue
     return False
+
+
+# 本轮收集到的中断（HITL 审批 / 补字段），等 trace 落库后写成 EVENT。
+# 为什么要事件化：LangGraph 的 interrupt 是「抛异常 → 挂起 → 恢复时重跑节点」，
+# 每次 resume 都会多导出一个同名的 Middleware span（实测一次审批出现 3~6 个），
+# 用 interrupt.id 做幂等键写成 EVENT，无论重放多少次都只有一条，统计才干净。
+_PENDING_INTERRUPTS: dict[str, list[dict]] = {}
+
+
+def notify_interrupts(thread_id: str | None, interrupts: list[dict] | None) -> None:
+    """登记本轮中断，供 patch_trace_io 在 trace 落库后写成 EVENT。"""
+    if not thread_id or not interrupts:
+        return
+    _PENDING_INTERRUPTS[thread_id] = list(interrupts)
+
+
+def _pop_interrupts(thread_id: str) -> list[dict]:
+    return _PENDING_INTERRUPTS.pop(thread_id, [])
 
 
 def flush() -> None:

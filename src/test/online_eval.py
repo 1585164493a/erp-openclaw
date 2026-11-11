@@ -54,8 +54,19 @@ WRITE_TOOLS = {                # 写工具：调了却没有停下来等人审�
     "supplier_create", "order_create", "customer_create",
     "product_create", "order_update", "customer_update",
 }
-# 中断/审批相关的 observation 名字里通常带这些词
-HITL_HINTS = ("hitl", "interrupt", "审批", "中断")
+# 中断/审批相关的 observation 名字里通常带这些词。
+# ⚠️ 必须包含 "humanintheloop"：中间件真实名字是 HumanInTheLoopMiddleware，
+#    小写后**不含** "hitl" 这个子串，只写 hitl 会漏判（2026-11-12 实测）。
+HITL_HINTS = ("hitl", "humanintheloop", "interrupt", "approval", "审批", "中断")
+
+# 写操作的必填字段：审批卡片里缺这些，人工根本没法判断该不该批。
+# 宁可少列，不要列错——列错的代价是每天误报。
+REQUIRED_FIELDS = {
+    "supplier_create": ("name", "contact_person", "phone", "credit_rating"),
+    "customer_create": ("name", "contact_person", "phone", "customer_type", "discount_level"),
+    "product_create": ("name",),
+    "order_create": ("supplierId",),
+}
 
 # ============ 答案质量断言（2026-11-11 从一条真实 bad case 提炼）============
 # 那次用户问「帮我查一下都有哪些sku」，模型给了统计分析和一条虚构的报告路径。
@@ -195,6 +206,12 @@ def extract_facts(trace: dict, observations: list[dict], existing_scores: list[d
             if isinstance(p, str):
                 written_paths.add(p)
 
+    # 工具入参：用于「批了 A 却写了 B」的一致性比对
+    tool_inputs: dict[str, list] = {}
+    for o in observations:
+        if (o.get("type") or "").upper() == "TOOL":
+            tool_inputs.setdefault(o.get("name") or "", []).append(o.get("input"))
+
     return {
         "trace_id": trace.get("id"),
         "input": trace.get("input"),
@@ -207,22 +224,42 @@ def extract_facts(trace: dict, observations: list[dict], existing_scores: list[d
         "tool_repeat": best,
         "generations": gen_count,
         "errors": [e.get("name") for e in errors],
+        # 名字 + 状态：状态用于区分「真报错」和「HITL 中断被记成 ERROR」（见 R1）
+        "errors_detail": [{"name": e.get("name") or "", "status": e.get("statusMessage") or ""}
+                          for e in errors],
+        # 中断事件（由 langfuse_trace 写成 EVENT，一次中断一条，重放不重复）
+        "hitl_events": [
+            (o.get("metadata") or {}) for o in observations
+            if (o.get("type") or "").upper() == "EVENT" and (o.get("name") or "") == "hitl_interrupt"
+        ],
+        "tool_inputs": tool_inputs,
+        "tags": trace.get("tags") or [],
         "has_hitl": has_hitl,
         "user_feedback": _user_feedback(existing_scores or []),
     }
 
 
-def _fetch_scores(trace_id: str) -> list[dict]:
+def _fetch_scores(trace_id: str, max_pages: int = 12) -> list[dict]:
     """取这条 trace 上的分数。
 
-    ⚠️ 实测 2026-11-11：`/api/public/scores?traceId=xxx` 的过滤参数**不生效**
-    （返回的是全项目最近分数），只能先拉一批再在本地按 traceId 过滤。
+    ⚠️ 两个实测坑（2026-11-11/12）：
+    1. `/api/public/scores?traceId=xxx` 的过滤参数**不生效**（返回全项目最近分数），
+       只能在本地按 traceId 过滤；
+    2. 只拉一页（100 条）会漏——规则分一多，老 trace 的分就被挤出窗口，
+       表现为 `q=-`（明明有分却读不到）。所以这里翻页直到取完。
     """
-    try:
-        data = lf_get("/api/public/scores", {"limit": 100}).get("data") or []
-    except Exception:  # noqa: BLE001
-        return []
-    return [s for s in data if isinstance(s, dict) and s.get("traceId") == trace_id]
+    out: list[dict] = []
+    for page in range(1, max_pages + 1):
+        try:
+            data = lf_get("/api/public/scores", {"limit": 100, "page": page}).get("data") or []
+        except Exception:  # noqa: BLE001
+            break
+        if not data:
+            break
+        out.extend(s for s in data if isinstance(s, dict) and s.get("traceId") == trace_id)
+        if len(data) < 100:
+            break
+    return out
 
 
 def _user_feedback(scores: list[dict]) -> float | None:
@@ -252,8 +289,39 @@ def run_rules(f: dict) -> tuple[list[dict], list[str]]:
                        "dataType": dtype, "comment": comment, "traceId": f["trace_id"]})
 
     # R1 报错：出现 ERROR 级 observation。硬约束，出现即告警
-    if f["errors"]:
-        add("error_present", 1, "BOOLEAN", f"报错节点：{', '.join(f['errors'][:3])}")
+    #
+    # ⚠️ 2026-11-12 实测：写操作的 HITL 中断会以 ERROR 形式出现，且 statusMessage 是
+    #    异常对象没实现 __str__ 的产物（形如 "<object object at 0x...>"）——
+    #    那是 LangGraph 的 interrupt 哨兵，不是真错误。这类要豁免，否则三条写操作
+    #    用例（12/14/15）会被误判成失败。
+    # 无信息量的「错误」状态：对象枚举没实现 __repr__（`<object object at 0x...>`）、
+    # asyncio 取消栈（`(<object …>, <Task cancelled …>)`）、
+    # 以及 LangGraph 直接把中断对象打进 status（`(Interrupt(value={...}),)`）——
+    # 三者都是 HITL 中断的副产物，不是真错误。
+    _NOISE_STATUS = re.compile(
+        r"(object at 0x[0-9a-fA-F]+|Task cancelled|cancel scope"
+        r"|Interrupt\(value=|GraphInterrupt|GeneratorExit|StopAsyncIteration"
+        r"|HITL 中断|等待人工审批)"
+    )
+    details = f.get("errors_detail") or []
+    if details:
+        # 有信息量的错误 = 状态既不是那个对象哨兵、也不是空
+        informative = [d for d in details
+                       if d.get("status", "").strip()
+                       and not _NOISE_STATUS.search(d["status"].strip())]
+        if informative:
+            real_errors = [d["name"] for d in informative]
+        elif f.get("has_hitl"):
+            # 有 HITL 中断、且错误都没给出有效信息 → 判定为「中断被记成 ERROR」
+            real_errors = []
+        else:
+            real_errors = [d["name"] for d in details
+                           if not _NOISE_STATUS.search((d.get("status") or "").strip())]
+    else:
+        real_errors = list(f["errors"])
+
+    if real_errors:
+        add("error_present", 1, "BOOLEAN", f"报错节点：{', '.join(real_errors[:3])}")
         reasons.append("error")
     else:
         add("error_present", 0, "BOOLEAN")
@@ -306,6 +374,71 @@ def run_rules(f: dict) -> tuple[list[dict], list[str]]:
     else:
         add("hallucinated_path", 0, "BOOLEAN")
 
+    # ============ R8~R11 HITL 决策点指标 ============
+    # 设计思路：HITL trace 不评「整轮质量」，只评「决策点」——
+    #   有没有问、问得全不全、人怎么答、批的和写的对不对。
+    events = f.get("hitl_events") or []
+    write_tools = [t for t in (f.get("tools") or []) if t in WRITE_TOOLS]
+    approval_events = [e for e in events if (e.get("kind") or "") == "hitl_approval"]
+
+    if events or write_tools:
+        # R8 写操作前是否发起审批
+        # 续跑 trace（resume）里只有"批准之后"的执行，审批发生在上一条 trace，豁免
+        if "resume" in (f.get("tags") or []):
+            add("approval_asked", 1, "BOOLEAN", "续跑 trace：审批在上一轮完成")
+        elif write_tools and not approval_events:
+            add("approval_asked", 0, "BOOLEAN", "写操作前没有发起审批请求")
+            reasons.append("no_approval")
+        else:
+            add("approval_asked", 1, "BOOLEAN")
+
+        # R9 审批载荷完整性（缺必填字段 → 人工没法判断该不该批）
+        if approval_events:
+            missing = []
+            for e in approval_events:
+                args = e.get("args") or {}
+                if not isinstance(args, dict):
+                    continue
+                need = REQUIRED_FIELDS.get(e.get("tool") or "", ())
+                miss = [k for k in need if not str(args.get(k) or "").strip()]
+                if miss:
+                    missing.append(f"{e.get('tool')} 缺 {','.join(miss)}")
+            if missing:
+                add("approval_payload_complete", 0, "BOOLEAN", "; ".join(missing)[:160])
+                reasons.append("payload_incomplete")
+            else:
+                add("approval_payload_complete", 1, "BOOLEAN")
+
+        # R10 结局分类：pending 不是"差"，是"还没结果"——所以用分类而不是打分
+        ans = f.get("answer_text") or ""
+        if write_tools:
+            outcome = "approved"
+        elif approval_events and any(k in ans for k in ("拒绝", "取消", "不批", "驳回")):
+            outcome = "rejected"
+        else:
+            outcome = "pending"
+        add("approval_outcome", outcome, "CATEGORICAL")
+
+        # R11 批的是不是写的（防「批 A 写 B」）
+        mismatch = []
+        for e in approval_events:
+            tool = e.get("tool") or ""
+            if tool not in write_tools:
+                continue
+            approved_args = e.get("args") or {}
+            calls = (f.get("tool_inputs") or {}).get(tool) or []
+            if not isinstance(approved_args, dict) or not calls:
+                continue
+            actual = calls[-1] if isinstance(calls[-1], dict) else {}
+            for k, v in approved_args.items():
+                if k in actual and str(actual[k]) != str(v):
+                    mismatch.append(f"{tool}.{k}: 批 {v!r} → 写 {actual[k]!r}")
+        if mismatch:
+            add("post_approval_consistent", 0, "BOOLEAN", "; ".join(mismatch)[:160])
+            reasons.append("approval_mismatch")
+        else:
+            add("post_approval_consistent", 1, "BOOLEAN")
+
     return scores, reasons
 
 
@@ -357,16 +490,32 @@ def ensure_bad_case_dataset() -> None:
         print(f"  [warn] 建数据集返回 {code}")
 
 
-def _existing_quality(scores: list[dict], name: str) -> float | None:
-    """读 Langfuse judge 已经写在这条 trace 上的质量分（plan B：judge 在平台跑，脚本只读）。"""
+def _existing_quality(scores: list[dict], name: str) -> tuple[float | None, str]:
+    """读 Langfuse judge 已写在这条 trace 上的质量分，连同它的理由一起带回。
+
+    ⚠️ judge 的 original 分数是 observation 级的，`comment` 里才是可读理由；
+    以前只抄了数值、comment 写成"来自 Langfuse judge"，等于把最有价值的部分丢了。
+    """
+    best: tuple[float, str] | None = None
     for s in scores:
-        if isinstance(s, dict) and (s.get("name") or "") == name:
-            for key in ("value", "stringValue"):
-                try:
-                    return float(s.get(key))
-                except (TypeError, ValueError):
-                    continue
-    return None
+        if not isinstance(s, dict) or (s.get("name") or "") != name:
+            continue
+        val = None
+        for key in ("value", "stringValue"):
+            try:
+                val = float(s.get(key))
+                break
+            except (TypeError, ValueError):
+                continue
+        if val is None:
+            continue
+        comment = (s.get("comment") or "").strip()
+        # 优先取带理由的那条（judge 写在 observation 级）
+        if best is None or (comment and not best[1]):
+            best = (val, comment)
+    if best is None:
+        return None, ""
+    return best[0], best[1]
 
 
 def existing_bad_trace_ids() -> set[str]:
@@ -446,7 +595,10 @@ def main() -> int:
     pushed = 0
     skipped = 0
     our_scores = {"error_present", "loop_suspected", "write_without_hitl",
-                  "slow_trace", "empty_output", "quality_score"}
+                  "slow_trace", "empty_output", "quality_score",
+                  "answer_has_records", "hallucinated_path",
+                  "approval_asked", "approval_payload_complete",
+                  "approval_outcome", "post_approval_consistent"}
     for t in reversed(traces):                       # 从旧到新
         existing = _fetch_scores(t.get("id"))
         seen = {s.get("name") for s in existing if isinstance(s, dict)}
@@ -458,18 +610,26 @@ def main() -> int:
         f = extract_facts(t, obs, existing)
 
         # 质量分：优先读 Langfuse judge 写的（plan B：judge 搬进 Langfuse，脚本只读结果）
-        quality, jreason = _existing_quality(existing, args.quality_score_name), ""
-        if quality is not None:
-            jreason = f"来自 Langfuse judge（{args.quality_score_name}）"
+        quality, jreason = _existing_quality(existing, args.quality_score_name)
+        if quality is not None and not jreason:
+            jreason = "judge 未给理由"
         elif args.judge and f["question_text"] and f["answer_text"]:
             quality, jreason = judge_quality(f["question_text"][:1500], f["answer_text"][:2000])
 
         scores, reasons = run_rules(f)
 
+        if quality is not None and "resume" in (f.get("tags") or []):
+            # 续跑 trace 没有用户提问（input 是"恢复中断"），judge 只能凭上下文猜，
+            # 实测会稳定给 1~2 分并写"用户未提供任何提问内容"——这种分是噪音，不复制。
+            quality = None
+            reasons.append("resume_skip_quality")
+
         if quality is not None:
-            # 只写 trace 级的 quality_score：名字和平台 judge 的 quality 区分开。
-            # ⚠️ 别再往 trace 级写同名的 quality —— 会和 judge 的 observation 级同名冲突，
-            #    表格列取不到值（实测 2026-11-11，踩过一次）。
+            # trace 级 quality：表格/看板只认 trace 级分数，judge 写的是 observation 级，
+            # 不复制一份的话 trace 列表里那列永远是空的（2026-11-12 反复验证过）。
+            scores.append({"id": _score_id(f["trace_id"], "quality"), "name": "quality",
+                           "value": quality, "dataType": "NUMERIC",
+                           "comment": jreason or "", "traceId": f["trace_id"]})
             scores.append({"id": _score_id(f["trace_id"], "quality_score"), "name": "quality_score",
                            "value": quality, "dataType": "NUMERIC",
                            "comment": jreason, "traceId": f["trace_id"]})
