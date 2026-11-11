@@ -24,6 +24,7 @@ from agent.schema import (
     Message,
 )
 from api_view.agent_loader import agent_loader
+from agent.langfuse_trace import attach as attach_langfuse, flush as flush_langfuse
 
 
 # 创建路由
@@ -340,6 +341,9 @@ async def stream_chat_response(
     # Token 用量采集：挂成回调，LangChain 会把它传播到子 Agent 的模型调用上
     usage_collector = TurnUsageCollector()
     config.setdefault("callbacks", []).append(usage_collector)
+
+    # Langfuse 追踪：没配 .env.langfuse 时自动跳过，对原有行为零影响
+    attach_langfuse(config, thread_id=thread_id, user_id=user_id)
 
     def usage_sse() -> str:
         """本轮用量事件（在 done / interrupt 之前发，前端好把数字挂到这条消息上）。"""
@@ -697,6 +701,10 @@ async def stream_chat_response(
             "type": "error",
             "message": str(e)
         })
+
+    finally:
+        # 追踪是异步批量上报的，请求结束前必须 flush，否则 trace 可能还没发出去
+        flush_langfuse()
 
 
 # ============================================================

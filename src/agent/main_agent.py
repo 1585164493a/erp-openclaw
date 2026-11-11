@@ -117,12 +117,35 @@ async def precompute_agent_context() -> PrecomputedContext:
     logger.info("=== 预计算 Agent 上下文（Phase 2/3/5）===")
 
     # Phase 2: MCP 工具加载
+    #
+    # ⚠️ 2026-11-10 加了三重重试。原因：
+    #   启动器虽然会先等 8099 的 TCP 通了才拉起后端，但「TCP 通了」≠「MCP 端点可用」——
+    #   服务此时可能还在预热工具列表 / 首次握手。原来一次失败就 raise，
+    #   后端进程直接退出，启动器再等 240 秒、然后判失败并（旧版）连坐杀掉 8080/8099。
+    #   加重试后，这类几秒级的时序抖动能自愈，不必让用户重新点一次启动。
+    #
+    #   注意：重试只针对「连接/握手」这类瞬时错误；如果 erp-api 真的挂了，
+    #   三次都会失败，仍然 raise —— 那个语义没有放松。
     logger.info("Phase 2: 加载 MCP 工具...")
-    try:
-        toolset: McpToolset = await load_mcp_tools()
-    except Exception:
-        logger.exception("MCP 工具加载失败")
-        raise RuntimeError("MCP 工具加载失败，无法预计算")
+    toolset: Optional[McpToolset] = None
+    last_exc: Optional[BaseException] = None
+    for attempt in range(1, 4):
+        try:
+            toolset = await load_mcp_tools()
+            if attempt > 1:
+                logger.info("  第 %d 次尝试成功", attempt)
+            break
+        except Exception as exc:  # noqa: BLE001 - 故意兜住一切，下面统一重试
+            last_exc = exc
+            logger.warning("MCP 工具加载失败（第 %d/3 次）：%s: %s",
+                           attempt, type(exc).__name__, exc)
+            if attempt < 3:
+                backoff = 2.0 * attempt          # 2s, 4s
+                logger.info("  %.0f 秒后重试...", backoff)
+                await asyncio.sleep(backoff)
+    if toolset is None:
+        logger.error("MCP 工具加载失败（已重试 3 次），最后一次异常：%r", last_exc)
+        raise RuntimeError("MCP 工具加载失败，无法预计算") from last_exc
 
     # Phase 3: 可视化工具合并
     logger.info("Phase 3: 合并可视化工具 (26→1)...")
@@ -296,9 +319,28 @@ async def create_main_agent(
         MemoryUpdateMiddleware(model=SUMMARY_MODEL),
         # 9. 沙箱熔断：连续沙箱错误 ≥ 阈值 → jump_to=end
         SandboxCircuitBreakerMiddleware(),
-        # 10. 调用限制
-        ModelCallLimitMiddleware(run_limit=50),
-        ToolCallLimitMiddleware(run_limit=200),
+        # 10. 调用限制（主 Agent）
+        #
+        # ⚠️ 2026-11-10 收紧：50/200 → 20/40，并补上 thread_limit。
+        #
+        # 为什么收紧（依据是主 Agent 的真实开销，不是拍脑袋）：
+        #   主 Agent 的职责只有三件 — 意图识别、任务拆解、委派汇总。
+        #   正常单域任务 3~5 次模型调用；多域任务（销量+库存+采购）10~15 次；
+        #   HITL 中断恢复再 +2~4 次。所以 20 已经覆盖极端情况还有余量。
+        #   原来的 50 是 5~10 倍余量 —— 作为"防死循环"太松，作为"预算"又没意义。
+        #
+        #   更重要的用途变化：这个上限现在当**自检线**用 ——
+        #   如果主 Agent 单轮经常超过 15 次，说明它没做到"只做规划和委派"，
+        #   而是直接调了业务工具。那时要查的是设计，不是继续调大上限。
+        #
+        # 为什么补 thread_limit（这是原来的真漏洞）：
+        #   run_limit 是**每次 invoke** 累计、每轮重置 → 拦不住"连续问 20 轮 × 50 次"。
+        #   thread_limit 跨 invoke 累计，150 ≈ 10 轮 × 15 次，够正常对话用，
+        #   又能拦住"某个会话一直失控"。
+        #   子 Agent 的 profile 刻意不加 thread_limit —— 因为子 Agent 本来就会
+        #   被反复委派，加上去会误伤正常的多轮协作。
+        ModelCallLimitMiddleware(run_limit=20, thread_limit=150),
+        ToolCallLimitMiddleware(run_limit=40, thread_limit=300),
     ]
 
     # ---- Phase 9: create_deep_agent ----

@@ -80,18 +80,29 @@ def _start(desc, cmd, env, cwd=None):
 
 
 def wait_http(url, needle=None, max_wait=60, label="HTTP"):
-    """轮询等待 HTTP 就绪。"""
+    """轮询等待 HTTP 就绪。
+
+    ⚠️ 2026-11-10 加了进度打印。原因：后端就绪原本要等最多 240 秒，
+       期间一行输出都没有 —— 用户看到的是一个卡住的窗口，分不清
+       "还在启动" 和 "已经死了"。现在每 15 秒打一行已用时间。
+    """
     start = time.time()
+    next_report = 15.0
     while time.time() - start < max_wait:
         try:
             with urllib.request.urlopen(url, timeout=3) as resp:
                 if resp.status == 200:
                     body = resp.read().decode("utf-8", errors="replace")
                     if needle is None or needle in body:
-                        print(f"[System] {label} 就绪: {url}")
+                        elapsed = time.time() - start
+                        print(f"[System] {label} 就绪: {url}（用时 {elapsed:.0f}s）")
                         return True
         except Exception:
             pass
+        elapsed = time.time() - start
+        if elapsed >= next_report:
+            print(f"[System]   等待 {label}... 已等 {elapsed:.0f}s / 上限 {max_wait}s")
+            next_report += 15.0
         time.sleep(1.5)
     print(f"[ERROR] {label} 等待超时: {url} ({max_wait}s)")
     return False
@@ -253,6 +264,16 @@ def main():
     procs = []
     stopped = threading.Event()
 
+    # ⚠️ 2026-11-10 新增：是否跳过退出时的「端口清扫」。
+    #
+    # 为什么需要这个开关：cleanup() 末尾会调 _free_our_ports()，它把 OUR_PORTS
+    # (8080/8099/8091/3000) 上**任何**进程都 taskkill /T /F —— 不区分是谁起的。
+    # 所以「后端起不来」时如果照常 cleanup，本来已经健康的 ERP-API 和 MCP 会被连坐杀掉，
+    # 表现就是用户的脚本正跑着，突然 ConnectionResetError 10054。
+    #
+    # 用 list 而不是 bool：cleanup 是嵌套函数，只有可变容器能在内层改外层。
+    skip_sweep = [False]
+
     def _kill_tree(pid: int, why: str = "") -> None:
         """按【整棵进程树】杀。
 
@@ -289,7 +310,11 @@ def main():
                         pass
         # 再兜一遍：清理所有仍占着我们端口的进程
         # （覆盖"父进程不是我们"的情况，例如之前某次启动留下的残留）
-        _free_our_ports(verbose=True)
+        # ⚠️ 但 skip_sweep 为真时跳过 —— 见 skip_sweep 定义处的原因说明。
+        if skip_sweep[0]:
+            print("[System] 跳过端口清扫（保留 ERP-API / MCP，不连坐）")
+        else:
+            _free_our_ports(verbose=True)
         print("[System] 全部服务已停止")
 
     # 兜底：无论从哪条路径退出（含未捕获异常），都走一次清理
@@ -310,11 +335,30 @@ def main():
         sys.exit(1)
 
     # 3) 后端（启动时预计算 MCP 工具 + 初始化 Agent）
+    #
+    # ⚠️ 2026-11-10 把 240 秒降到 150 秒：
+    #   正常启动实测 60~90 秒（MCP 工具加载 + 子 Agent 配置校验 + 中间件装配）。
+    #   240 秒意味着"后端真挂了"也要等 4 分钟才发现，而等待期间用户只能盯着窗口。
+    #   150 秒对正常启动有 60 秒余量，对故障路径则快 90 秒暴露。
+    #   配合下面 wait_http 的进度打印，等待过程不再是黑屏。
     proc = run_backend()
     procs.append(("Backend", proc))
-    if not wait_http("http://localhost:8091/health", "healthy", max_wait=240, label="Backend"):
+    if not wait_http("http://localhost:8091/health", "healthy", max_wait=150, label="Backend"):
         print("[ERROR] 后端未能在 240 秒内就绪，请检查上方日志（常见原因：MongoDB/OpenSandbox 未启动）")
-        cleanup()
+        # ⚠️ 2026-11-10 修复「后端起不来就把整个栈带走」：
+        #    原来这里直接 cleanup()，而 cleanup() 会杀掉 procs 里全部进程
+        #    （ERP-API + MCP），再 _free_our_ports() 兜一层端口清扫。
+        #    结果：后端因 MCP 工具预计算失败时，本来健康的 8080/8099 也被杀掉，
+        #    正在跑评测的脚本立刻 ConnectionResetError 10054。
+        #
+        #    现在的策略：**只终止 Backend，保留 ERP-API 与 MCP** ——
+        #    它们是健康的，排查完后端可以单独重试，不必从头再起一遍。
+        skip_sweep[0] = True
+        _kill_tree(proc.pid, "只终止 Backend")
+        procs[:] = [p for p in procs if p[0] != "Backend"]
+        print()
+        print("[System] ERP-API(8080) 与 MCP(8099) 仍在运行 —— 排查后端后可单独重试。")
+        print("[System] 若要全部停掉，关掉本窗口或用 ops/stop_servers.ps1。")
         sys.exit(1)
 
     # 4) 前端
