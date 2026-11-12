@@ -205,6 +205,7 @@ def register_order_tools(mcp: FastMCP):
         product_name: Optional[str] = None,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
+        limit: int = 50,
         ctx: Context = None,
     ) -> list:
         """
@@ -217,17 +218,25 @@ def register_order_tools(mcp: FastMCP):
             product_name: 商品名称（模糊查询），可选
             start_date: 开始日期（yyyy-MM-dd 格式），可选
             end_date: 结束日期（yyyy-MM-dd 格式），可选
+            limit: 返回条数，默认 50，最大 200。**只用于看明细**；
+                按月/按供应商聚合请走 sql_query（这个接口不适合做汇总）
         """
         http_client = await get_http_client()
 
-        # 构建请求参数（过滤 None 值，映射到 API 字段名）
+        # 构建请求参数（过滤 None 值）
+        # ⚠️ 2026-11-12 修复：这里原来发的是 productName/startDate/endDate（驼峰），
+        # 但 API 端点是按 **snake_case** 取参（见 erp_api/main.py orders_search_details），
+        # 结果：所有过滤条件被**静默忽略**，永远返回全量 200 条 →
+        #   ① 子 Agent 拿不到按月数据；② 结果过大触发 offload，模型去沙箱找不存在的文件，
+        #   实测一题因此白烧 100+ 秒并最终让用户三选一。
         request_params = {}
         if product_name is not None:
-            request_params["productName"] = product_name
+            request_params["product_name"] = product_name
         if start_date is not None:
-            request_params["startDate"] = start_date
+            request_params["start_date"] = start_date
         if end_date is not None:
-            request_params["endDate"] = end_date
+            request_params["end_date"] = end_date
+        request_params["limit"] = limit
 
         try:
             response = await http_client.get(

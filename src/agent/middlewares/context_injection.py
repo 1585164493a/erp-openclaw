@@ -40,8 +40,14 @@ class ContextInjectionMiddleware(AgentMiddleware):
 
         logger.info(f"ContextInjectionMiddleware: 注入用户上下文 user_id={user_id}, username={username}")
 
+        # 注入当前时间：没有它，"11 月""上个月""最近"全靠模型猜年份
+        # （实测 2026-11 的库里问"11 月"，被答成 2025-11 —— 见 bench V15）
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone(timedelta(hours=8)))      # Asia/Shanghai
         notice = (
             f"【系统上下文】\n"
+            f"当前时间: {now.strftime('%Y-%m-%d %H:%M')}（{now.strftime('%A')}，时区 UTC+8）\n"
             f"当前用户 user_id: {user_id}\n"
             f"当前用户 username: {username}\n"
             f"用户偏好文件路径: /memories/{user_id}/preferences.md\n"

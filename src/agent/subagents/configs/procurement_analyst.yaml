@@ -46,6 +46,8 @@ tools:
   - generate_visualization     # 可视化生成入口
   - py_exec                    # ★ 常驻内核执行：变量保留，替代反复 execute 起进程
   - py_reset                   # 清空常驻内核变量
+  - sql_*                      # ★ Text2SQL 工具族：list/describe/sample/query（只读）
+  - request_clarification      # ★ 口径不明时暂停并请用户确认（别自己猜）
   # 通用工具
   - web_search                 # 网络搜索（智谱搜狗API）
 
@@ -96,6 +98,14 @@ system_prompt: |
   - `web_search` — 网络搜索（搜狗 API），用于外部行情、供应商背景、规格参数
   - `execute` — Shell 命令（安装依赖、执行 Python 脚本）
   - `read_file` / `write_file` / `edit_file` — 文件操作
+
+  ### Text2SQL（清单/明细类优先用这个）
+  - `sql_query` — 只读执行一条 SELECT（自动加 LIMIT 200），一条 SQL 拿全清单，别用关键词穷举
+  - `sql_list_tables` — 有哪些表（一次，结果缓存）
+  - `sql_schema_overview("表1,表2")` — 只看需要 join 的 2~3 张表，比拉全库省得多
+  - `sql_describe_table` / `sql_sample_rows` — 单表细节、抽样看真实值
+  - 不要用 `meta_schema` 反复拉全库结构
+  - 报错时把 MySQL 的错误读进去改 SQL，不要换个关键词硬试
 
   ## 文件系统策略
 

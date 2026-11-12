@@ -163,6 +163,20 @@ def attach(
         metadata.setdefault("langfuse_trace_name", trace_name)
     if tags:
         metadata.setdefault("langfuse_tags", tags)
+    # 版本戳：从历史 trace 挖回归题时，靠它区分"这条失败是不是已经修了"
+    try:
+        from agent.version import version_info
+
+        info = version_info()
+        for key in ("agent_version", "git_commit", "sandbox_image", "started_at"):
+            metadata.setdefault(key, info.get(key))
+        tags = list(tags or [])
+        vt = f"v:{info['agent_version']}"
+        if vt not in tags:
+            tags.append(vt)
+        metadata["langfuse_tags"] = tags
+    except Exception:  # noqa: BLE001
+        pass
     return config
 
 

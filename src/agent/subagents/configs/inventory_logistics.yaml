@@ -42,6 +42,8 @@ tools:
   - generate_visualization     # 图表生成统一入口（25 种图表按 chart_type 路由）
   - py_exec                    # ★ 常驻内核执行：变量保留，替代反复 execute 起进程
   - py_reset                   # 清空常驻内核变量
+  - sql_*                      # ★ Text2SQL 工具族：list/describe/sample/query（只读）
+  - request_clarification      # ★ 口径不明时暂停并请用户确认（别自己猜）
   - web_search                 # 网络搜索（外部行情 / 承运商背景）
 
 # 技能路径（渐进式加载，按需激活）—— 恰好一个，scope 由此推导为 "inventory"
@@ -96,6 +98,14 @@ system_prompt: |
   - `web_search` — 外部行情、承运商背景
   - `execute` — Shell 命令（跑 Python 计算）
   - `read_file` / `write_file` / `edit_file` — 文件操作
+
+  ### Text2SQL（清单/明细类优先用这个）
+  - `sql_query` — 只读执行一条 SELECT（自动加 LIMIT 200），一条 SQL 拿全清单，别用关键词穷举
+  - `sql_list_tables` — 有哪些表（一次，结果缓存）
+  - `sql_schema_overview("表1,表2")` — 只看需要 join 的 2~3 张表，比拉全库省得多
+  - `sql_describe_table` / `sql_sample_rows` — 单表细节、抽样看真实值
+  - 不要用 `meta_schema` 反复拉全库结构
+  - 报错时把 MySQL 的错误读进去改 SQL，不要换个关键词硬试
 
   ## 工作流程
 

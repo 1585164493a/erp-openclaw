@@ -467,6 +467,30 @@ async def stream_chat_response(
                             "actions": [a["name"] for a in interrupt_value["action_requests"]],
                         })
 
+                    elif interrupt_value.get("type") == "clarification_request":
+                        # ---- 口径澄清中断（request_clarification 工具）----
+                        pending_interrupts.append({
+                            "id": getattr(interrupt, "id", None),
+                            "kind": "clarification",
+                            "tool": "request_clarification",
+                            "args": {"question": interrupt_value.get("question"),
+                                     "options": interrupt_value.get("options")},
+                            "allowed": [],
+                            "source": "main",
+                        })
+                        yield usage_sse()
+                        yield create_sse_message({
+                            "type": "interrupt",
+                            "interrupt_type": "clarification",
+                            "question": interrupt_value.get("question"),
+                            "options": interrupt_value.get("options") or "",
+                            "assumed": interrupt_value.get("assumed") or "",
+                            "thread_id": thread_id,
+                        })
+                        write_debug_log(debug_log, "INTERRUPT_CLARIFY", {
+                            "question": str(interrupt_value.get("question"))[:120],
+                        })
+
                     elif interrupt_value.get("type") == "order_info_request":
                         # ---- 第 1 层：数据补充中断（request_order_info 工具）----
                         pending_interrupts.append({

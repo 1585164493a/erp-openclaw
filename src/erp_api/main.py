@@ -1155,8 +1155,16 @@ def order_update(order_id: int, body: OrderBody):
 # ----------------------------------------------------------------
 @app.get("/api/orders/search-details")
 def orders_search_details(product_name: Optional[str] = None,
-                          start_date: Optional[str] = None, end_date: Optional[str] = None):
-    """搜索采购订单明细：可选 productName / startDate / endDate（按 order_time）。"""
+                          start_date: Optional[str] = None, end_date: Optional[str] = None,
+                          limit: int = 50):
+    """搜索采购订单明细：可选 productName / startDate / endDate（按 order_time）。
+
+    2026-11-12 改动：默认返回 **50 条**（原来 200），并支持 `limit`。
+    原因：单次返回 200 条明细会触发上层 offload 到 `/large_tool_results/`，
+    而那个路径在沙箱里不存在，模型会花一两百秒满盘找文件（实测一题 254 秒）。
+    要聚合请让上层用 sql_query，不要让这个接口承担分析职责。
+    """
+    limit = max(1, min(int(limit or 50), 200))
     where = ["od.deleted=0", "po.deleted=0"]
     params: list = []
     if product_name:
@@ -1181,8 +1189,8 @@ def orders_search_details(product_name: Optional[str] = None,
             "JOIN purchase_order po ON po.id=od.order_id AND po.deleted=0 "
             "JOIN product p ON p.id=od.product_id AND p.deleted=0 "
             "LEFT JOIN supplier s ON s.id=p.supplier_id "
-            "WHERE " + cond + " ORDER BY po.order_time DESC, od.id LIMIT 200",
-            tuple(params),
+            "WHERE " + cond + " ORDER BY po.order_time DESC, od.id LIMIT %s",
+            tuple(params) + (limit,),
         )
         raw = cur.fetchall()
     data = []

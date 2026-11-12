@@ -1,0 +1,188 @@
+# Text2SQL 陷阱题集（20 题）
+#
+# 用途：不是测"模型会不会写 SQL"——小库上它早就会；而是测**口径与边界**。
+# 每题标注：陷阱类型 / 期望行为 / 判定方式 / 标准 SQL（能自动对拍的给 SQL）。
+#
+# 判定方式：
+#   exec    —— 自动：比对执行结果（行数或集合），与 ground_truth 一致即通过
+#   contain —— 自动：答案文本必须包含指定关键词（如"没有该数据"）
+#   manual  —— 人工：看是否追问，无法自动判定
+#
+# 数据现状（2026-11-12 扩展后）：
+#   sales_daily 6150 行（2026-08-23 → 2026-11-12）
+#   supplier 35 家（其中 deleted=1 有 2 家、status=0 有 2 家、同名分部 1 家）
+#   inventory 8 条低于安全库存、2 条零库存
+#   purchase_order 295 单、order_detail 862 行、logistics 152 行
+
+version: 1
+questions:
+
+  # ---------------- ① 软删除陷阱 ----------------
+  - id: T01
+    category: soft_delete
+    trap: 漏掉 deleted=0
+    question: "公司现在一共有多少家供应商？"
+    expected: "必须排除 deleted=1 的 2 家"
+    judge: exec
+    ground_truth_sql: "select count(*) from supplier where deleted=0"
+    note: "答 35 说明漏过滤，答 33 才对"
+
+  - id: T02
+    category: soft_delete
+    trap: 漏掉 deleted=0 导致列出已删除条目
+    question: "把供应商清单拉给我"
+    expected: "清单里不能出现已软删除的 2 家"
+    judge: exec
+    ground_truth_sql: "select id from supplier where deleted=0 order by id"
+
+  - id: T03
+    category: soft_delete
+    trap: 统计销量时把删除行算进去
+    question: "最近一个月的总销量是多少？"
+    expected: "只统计 deleted=0 的 sales_daily"
+    judge: exec
+    ground_truth_sql: "select sum(quantity) from sales_daily where deleted=0 and sales_date >= date_sub('2026-11-12', interval 30 day)"
+
+  # ---------------- ② 状态/枚举陷阱 ----------------
+  - id: T04
+    category: status_filter
+    trap: 停用供应商是否算"现有供应商"
+    question: "还有多少家供应商在合作？"
+    expected: "应先明确口径（status=1 才算在用），或给出两个数字并说明差异"
+    judge: contain
+    contain_any: ["停用", "status", "在用", "状态"]
+
+  - id: T05
+    category: enum_translate
+    trap: 把枚举数字直接抛给用户
+    question: "客户都是什么类型的？"
+    expected: "必须翻译成业务含义（如经销商/KA商超/便利店），不能只给 1/2/3"
+    judge: contain
+    contain_any: ["经销商", "KA", "商超", "便利店"]
+
+  - id: T06
+    category: enum_translate
+    trap: 采购单状态码不翻译
+    question: "现在有哪些采购单还没入库？"
+    expected: "把 status 翻成中文（待审核/已审核/采购中），不能只列 1/2/3"
+    judge: contain
+    contain_any: ["待审核", "已审核", "采购中", "未入库"]
+
+  # ---------------- ③ 多对多 / join 爆炸 ----------------
+  - id: T07
+    category: join_many_to_many
+    trap: product × product_supplier × supplier 笛卡尔积
+    question: "哪些商品有超过两个供应商？"
+    expected: "按 product_id 聚合计数，且**只算未删除的供应商**"
+    judge: exec
+    ground_truth_sql: "select ps.product_id from product_supplier ps join supplier s on s.id=ps.supplier_id where ps.deleted=0 and s.deleted=0 group by ps.product_id having count(distinct ps.supplier_id) > 2"
+    note: "旧标准 SQL 漏了 supplier.deleted=0（13 vs 11），2026-11-12 修正"
+
+  - id: T08
+    category: join_many_to_many
+    trap: 订单金额用明细求和时重复计数
+    question: "每个供应商的采购总额是多少？"
+    expected: "应以 purchase_order.total_amount 为准，或按订单去重后求和"
+    judge: manual
+    note: "直接 sum(order_detail.subtotal) 会被多明细放大，需说明口径"
+
+  - id: T09
+    category: join
+    trap: 跨表统计漏过滤
+    question: "哪些商品从来没被采购过？"
+    expected: "用 left join 或 not exists，且两侧都过滤 deleted=0"
+    judge: exec
+    ground_truth_sql: "select count(*) from product p where p.deleted=0 and not exists (select 1 from order_detail d join purchase_order o on o.id=d.order_id where d.product_id=p.id and d.deleted=0 and o.deleted=0)"
+    note: "标准答案改回数量对拍（原先是 id 列表，模型答数量会被误判）"
+
+  # ---------------- ④ 跨域组合 ----------------
+  - id: T10
+    category: cross_domain
+    trap: 库存 × 供应商评级（3 张表）
+    question: "库存不足的商品里，哪些供应商的信用评级是 C 或 D？"
+    expected: "inventory → product → product_supplier → supplier 四表关联"
+    judge: exec
+    ground_truth_sql: "select distinct s.name from inventory i join product p on p.id=i.product_id join product_supplier ps on ps.product_id=p.id join supplier s on s.id=ps.supplier_id where i.deleted=0 and p.deleted=0 and s.deleted=0 and i.current_quantity < i.safety_stock and s.credit_rating in ('C','D')"
+    note: "2026-11-12 补了一个 C 级供应商（SUP-C-TRAP）挂到低库存商品上，否则标准 SQL 查不到数据"
+
+  - id: T11
+    category: cross_domain
+    trap: 销量 × 库存（口径不同：销量是历史，库存是当前）
+    question: "最近卖得最好的商品，现在库存还够吗？"
+    expected: "先按销量排序取 Top N，再关联 inventory 判断是否低于安全库存"
+    judge: manual
+
+  - id: T12
+    category: cross_domain
+    trap: 物流超期 × 订单状态
+    question: "哪些订单物流超期还没签收？"
+    expected: "logistics.estimated_arrival_time < now 且 actual_arrival_time 为空/未到"
+    judge: exec
+    ground_truth_sql: "select o.order_number from logistics l join purchase_order o on o.id=l.order_id where l.deleted=0 and l.actual_arrival_time is null and l.estimated_arrival_time < '2026-11-12'"
+
+  # ---------------- ⑤ 歧义 / 需要追问 ----------------
+  - id: T13
+    category: ambiguity
+    trap: 时间窗口没定义就猜
+    question: "最近销量怎么样？"
+    expected: "应追问或明确说明窗口（近 7 天 / 30 天），不能默默猜一个"
+    judge: contain
+    contain_any: ["7 天", "7天", "30 天", "30天", "近一周", "近一个月", "时间范围"]
+
+  - id: T14
+    category: ambiguity
+    trap: 库存不足的阈值没定义
+    question: "库存不足的有多严重？"
+    expected: "说明口径（低于安全库存），必要时给缺口分布，而不是只报条数"
+    judge: contain
+    contain_any: ["安全库存", "缺口", "safety_stock"]
+
+  - id: T15
+    category: ambiguity
+    trap: 卖得好的定义缺失
+    question: "哪个商品卖得最好？"
+    expected: "说明按销量还是按金额、窗口多长"
+    judge: contain
+    contain_any: ["销量", "金额", "窗口", "近", "口径"]
+
+  # ---------------- ⑥ 不可回答 / 拒答能力 ----------------
+  - id: T16
+    category: unanswerable
+    trap: 库里没有退货表，硬编数字
+    question: "上个月的退货率是多少？"
+    expected: "明确说库里没有退货数据，不要编"
+    judge: contain
+    contain_any: ["没有", "无", "不存在", "无法", "缺少"]
+
+  - id: T17
+    category: unanswerable
+    trap: 库里没有客户满意度
+    question: "客户满意度评分是多少？"
+    expected: "明确说没有该字段/表"
+    judge: contain
+    contain_any: ["没有", "无", "不存在", "缺少"]
+
+  - id: T18
+    category: unanswerable
+    trap: 未来数据不可知
+    question: "下个月的销量预测是多少？"
+    expected: "明确说没有预测数据，或先澄清「预测」指哪种口径；不能编造预测值"
+    judge: clarify
+    contain_any: ["没有预测", "无预测", "历史", "无法预测", "澄清", "口径", "哪一种", "确认", "希望要"]
+
+  # ---------------- ⑦ 明细完整性 ----------------
+  - id: T19
+    category: list_completeness
+    trap: 用汇总代替明细
+    question: "都有哪些供应商"
+    expected: "直接列清单（编码+名称），不能只给「共 33 家」这类汇总"
+    judge: exec
+    ground_truth_sql: "select count(*) from supplier where deleted=0"
+
+  - id: T20
+    category: list_completeness
+    trap: 低库存清单漏字段
+    question: "哪些商品库存不足，缺多少"
+    expected: "至少给出 商品 + 当前库存 + 安全库存 + 缺口 四列"
+    judge: contain
+    contain_any: ["当前库存", "安全库存", "缺口", "current_quantity", "safety_stock"]

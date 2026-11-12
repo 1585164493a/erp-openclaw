@@ -42,6 +42,8 @@ tools:
   - web_search                 # 网络搜索（品牌背景 / 企业工商信息核验）
   - py_exec                    # ★ 常驻内核执行：变量保留，替代反复 execute 起进程
   - py_reset                   # 清空常驻内核变量
+  - sql_*                      # ★ Text2SQL 工具族：list/describe/sample/query（只读）
+  - request_clarification      # ★ 口径不明时暂停并请用户确认（别自己猜）
 
 # 技能路径（渐进式加载，按需激活）—— 恰好一个，scope 由此推导为 "master"
 skills:
@@ -107,6 +109,22 @@ system_prompt: |
   | 自动 Summarization | 上下文达 85% 窗口 | 生成摘要，完整历史存入 `/conversation_history/` |
 
   **不要将原始 JSON 数据放在回复中。**
+
+  ## 查询工具怎么选（先看这段再动手）
+
+  | 场景 | 用什么 |
+  |---|---|
+  | 清单 / 明细 / 计数 / 任意组合条件 | **`sql_query`** 一条 SQL 拿全（最省调用） |
+  | 不熟悉有哪些表 | `sql_list_tables`（一次，结果会缓存） |
+  | 知道要查哪几张表 | **`sql_schema_overview("supplier,product")`** —— 只取需要的 2~3 张表 |
+  | 单表字段细节（默认值/可空） | `sql_describe_table` |
+  | 字段是编码（1/2/3） | 先 `meta_dict` 把编码翻译成业务含义，再回答 |
+
+  **注意**：不要用 `meta_schema` 反复拉全库结构（实测一轮里被调 6 次，白占上下文）。
+  结构信息用 `sql_list_tables` + `sql_schema_overview` 就够，且两者都有缓存。
+
+  **SQL 通道是只读的**：只允许 SELECT/WITH、单条语句、自动加 LIMIT 200；
+  报错时把 MySQL 的错误读进去改，不要换关键词硬试。
 
   ## 输出形态（先判断，再动手）
 

@@ -20,6 +20,9 @@ from langchain.agents.middleware import (
     ToolCallLimitMiddleware,
 )
 
+from agent.middlewares.tool_loop_guard import ToolLoopGuardMiddleware
+from agent.middlewares.tool_rollback import ToolRollbackMiddleware
+
 def _available_profiles() -> str:
     return ", ".join(sorted(MIDDLEWARE_PROFILES))
 
@@ -68,6 +71,8 @@ def create_analyst_middleware(model, backend) -> list:
     limits = [
         ModelCallLimitMiddleware(run_limit=50),
         ToolCallLimitMiddleware(run_limit=200),
+        ToolLoopGuardMiddleware(),          # 同名同参反复调用 → 降级/熔断
+        ToolRollbackMiddleware(backend=backend),   # 写操作失败 → 逆序补偿
     ]
     if os.getenv("AB_DISABLE_TOOLS_SUMMARIZATION") == "1":
         return limits
@@ -89,6 +94,8 @@ def create_write_middleware(model=None, backend=None) -> list:
     return [
         ModelCallLimitMiddleware(run_limit=20),
         ToolCallLimitMiddleware(run_limit=50),
+        ToolLoopGuardMiddleware(),          # 写操作尤其怕反复打扰审批
+        ToolRollbackMiddleware(backend=backend),   # 写失败 → 逆序补偿，不再走审批
     ]
 
 

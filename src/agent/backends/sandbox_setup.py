@@ -89,7 +89,57 @@ def setup_sandbox(config, sandbox_id=None, image=None) -> OpenSandboxBackend:
     # 拉起常驻代码执行服务（py_exec 工具的后端，避免每次起进程 + 重复 import）
     _start_kernel(backend)
 
+    # 安装 sitecustomize：中文字体 + 让"沙箱直连数据库"快速失败
+    _install_sitecustomize(backend)
+
     return backend
+
+
+_SITECUSTOMIZE_SRC = Path(__file__).with_name("sandbox_sitecustomize.py")
+
+_GUARD_CHECK_SRC = b"""import socket
+try:
+    socket.create_connection(("192.168.64.132", 3306), timeout=1)
+    print("GUARD_FAIL")
+except ConnectionRefusedError:
+    print("GUARD_OK")
+except Exception as e:
+    print("GUARD_OTHER", type(e).__name__)
+"""
+
+
+def _install_sitecustomize(backend: OpenSandboxBackend) -> None:
+    """把 sitecustomize.py 放进 venv 的 site-packages。
+
+    两个作用：
+    1. 中文字体（镜像里已有，这里兜底，换镜像也不会丢）；
+    2. **让沙箱直连 3306 立即失败** —— 实测某题在沙箱里 pymysql 连库超时，
+       反复重试烧了 1361 秒。fail-fast 比"指望模型别试"可靠。
+    """
+    try:
+        if not _SITECUSTOMIZE_SRC.exists():
+            return
+        r = backend.execute(
+            "ls -d /opt/skills-venv/lib/python*/site-packages 2>/dev/null | head -1"
+        )
+        site = (r.output or "").strip().splitlines()
+        site_dir = site[0].strip() if site else ""
+        if not site_dir:
+            print("[WARNING] 找不到 venv site-packages，跳过 sitecustomize")
+            return
+        backend.upload_files([
+            (f"{site_dir}/sitecustomize.py", _SITECUSTOMIZE_SRC.read_bytes()),
+            ("/tmp/_guard_check.py", _GUARD_CHECK_SRC),
+        ])
+        # 自检：导入不报错，且 3306 必须被拦（用文件跑，避免 shell 里拼 \n 出错）
+        check = backend.execute("/opt/skills-venv/bin/python3 /tmp/_guard_check.py")
+        out = (check.output or "").strip()
+        if "GUARD_OK" in out:
+            print("[INFO] sitecustomize 已安装（DB 直连已拦截）")
+        else:
+            print(f"[WARNING] sitecustomize 自检异常: {out[:120]}")
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARNING] sitecustomize 安装失败（不影响主流程）: {e}")
 
 
 _KERNEL_PATH = "/opt/kernel/kernel_server.py"

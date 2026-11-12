@@ -1,0 +1,147 @@
+# Text2SQL 难题集（hard）—— 专测 SQL 能力，不是考"会不会拒绝"
+#
+# 上一批（v2）16/20 通过，说明题目偏"口径/边界"，SQL 本身不难。
+# 这一批上强度：多跳 join、窗口函数、环比、占比、条件聚合、否定判断、分位。
+#
+# 判定：exec（标准 SQL 对拍）。每题的标准 SQL 必须先能跑通、结果非空。
+
+version: 1
+questions:
+
+  - id: H01
+    category: window_topn
+    question: "每个品类里销量最高的商品是哪个？"
+    judge: exec
+    ground_truth_sql: "select t.product_code from (select p.category, p.product_code, row_number() over (partition by p.category order by sum(d.quantity) desc) rn from sales_daily d join product p on p.id=d.product_id where d.deleted=0 and p.deleted=0 group by p.category, p.product_code) t where t.rn=1"
+
+  - id: H02
+    category: share
+    question: "哪些品类的销量占比超过 10%？"
+    judge: exec
+    ground_truth_sql: "select category from (select p.category, sum(d.quantity) q, sum(sum(d.quantity)) over () total from sales_daily d join product p on p.id=d.product_id where d.deleted=0 and p.deleted=0 group by p.category) t where q/total > 0.10"
+
+  - id: H03
+    category: month_over_month
+    question: "11 月销量比 10 月增长了多少？"
+    judge: exec
+    ground_truth_sql: "select round((nov - oct) / oct * 100, 2) growth_pct from (select (select sum(quantity) from sales_daily where deleted=0 and sales_date between '2026-11-01' and '2026-11-12') nov, (select sum(quantity) from sales_daily where deleted=0 and sales_date between '2026-10-01' and '2026-10-12') oct) t"
+    note: "2026-11-12 修正：原来拿不完整月(11月1-12日)比完整月(10月31天)，得出 -61.22% 是错的；改成同窗口对比 -1.16%"
+
+  - id: H04
+    category: multi_hop
+    question: "按供货关系（product_supplier 表）统计，供货品类最多的前 3 家供应商是谁？"
+    judge: exec
+    ground_truth_sql: "select s.name from supplier s join product_supplier ps on ps.supplier_id=s.id join product p on p.id=ps.product_id where s.deleted=0 and ps.deleted=0 and p.deleted=0 group by s.id, s.name order by count(distinct p.category) desc, count(distinct p.id) desc limit 3"
+    note: "2026-11-12 修正：题目必须点明看 product_supplier，否则按 product.supplier_id（主供应商）算也合理，两种口径答案完全不同"
+
+  - id: H05
+    category: negation
+    question: "有多少采购单还没有任何物流记录？"
+    judge: exec
+    ground_truth_sql: "select count(*) from purchase_order o where o.deleted=0 and not exists (select 1 from logistics l where l.order_id=o.id and l.deleted=0)"
+
+  - id: H06
+    category: group_count
+    question: "每个仓库低于安全库存的商品有多少个？"
+    judge: exec
+    ground_truth_sql: "select warehouse_location, count(*) n from inventory where deleted=0 and current_quantity < safety_stock group by warehouse_location"
+
+  - id: H07
+    category: date_diff
+    question: "各家供应商的平均交付周期是多少天？（按 purchase_order.supplier_id 归属供应商；只算 status=4 已入库且 actual_delivery_date 非空的订单；周期 = actual_delivery_date − order_time 的自然日）"
+    judge: exec
+    ground_truth_sql: "select s.name, round(avg(datediff(o.actual_delivery_date, date(o.order_time))),2) days from purchase_order o join supplier s on s.id=o.supplier_id where o.deleted=0 and s.deleted=0 and o.status=4 and o.actual_delivery_date is not null group by s.id, s.name order by days asc limit 5"
+    note: "2026-11-12 修正：题目原来没定'供应商归属'与'哪些订单计入'，agent 按明细供应商算、我按主供应商算，两边都对但答案不同"
+
+  - id: H08
+    category: enum_group
+    question: "客户按类型分布如何？平均折扣等级是多少？"
+    judge: exec
+    ground_truth_sql: "select customer_type, count(*) n, round(avg(discount_level),2) avg_level from customer where deleted=0 group by customer_type"
+
+  - id: H10
+    category: share
+    question: "全部数据里，各渠道的销售额占比是多少？"
+    judge: exec
+    ground_truth_sql: "select channel, round(sum(amount)/(select sum(amount) from sales_daily where deleted=0)*100, 2) pct from sales_daily where deleted=0 group by channel"
+    note: "2026-11-12 修正：题目原来没写时间窗口，模型自取近 30 天也合理；补上'全部数据'"
+
+  - id: H11
+    category: comparison
+    question: "有哪些商品的采购价高于同品类均价 20% 以上？"
+    judge: exec
+    ground_truth_sql: "select p.product_code from product p join (select category, avg(purchase_price) avg_price from product where deleted=0 group by category) c on c.category=p.category where p.deleted=0 and p.purchase_price > c.avg_price*1.2"
+
+  - id: H12
+    category: window_topn
+    question: "每个供应商报价最高的商品是哪个？"
+    judge: exec
+    ground_truth_sql: "select t.name, t.product_code from (select s.name, p.product_code, ps.quote_price, row_number() over (partition by s.id order by ps.quote_price desc) rn from product_supplier ps join supplier s on s.id=ps.supplier_id join product p on p.id=ps.product_id where ps.deleted=0 and s.deleted=0 and p.deleted=0) t where t.rn=1"
+
+  - id: H13
+    category: multi_hop
+    question: "哪些商品有多家供应商，且最高报价比最低报价高出 20% 以上？"
+    judge: exec
+    ground_truth_sql: "select p.product_code from product_supplier ps join product p on p.id=ps.product_id where ps.deleted=0 and p.deleted=0 group by p.id, p.product_code having count(distinct ps.supplier_id) > 1 and max(ps.quote_price) > min(ps.quote_price)*1.2"
+
+  - id: H14
+    category: cross_table
+    question: "11 月各渠道的目标达成率是多少？（目标取 sales_target 里 2026-11 的整月值，实际取 11-01 至 11-12 的销售额）"
+    judge: exec
+    ground_truth_sql: "select t.dimension_value, round(act.actual / t.target_amount * 100, 2) pct from sales_target t join (select channel, sum(amount) actual from sales_daily where deleted=0 and sales_date between '2026-11-01' and '2026-11-12' group by channel) act on act.channel = t.dimension_value where t.deleted=0 and t.target_month='2026-11' and t.dimension='channel'"
+    note: "2026-11-12 修正：原来的标准 SQL 只取 target_amount 三个值，太窄；改成算达成率，并写明口径"
+
+  - id: H15
+    category: derived
+    question: "按「当前库存 ÷ 近 30 天日均销量」算，库存周转最快（天数最少）的前 5 个商品是哪些？"
+    judge: exec
+    ground_truth_sql: "select p.product_code from inventory i join product p on p.id=i.product_id join (select product_id, sum(quantity)/30.0 avg_qty from sales_daily where deleted=0 and sales_date >= date_sub('2026-11-12', interval 30 day) group by product_id) s on s.product_id=i.product_id where i.deleted=0 and p.deleted=0 and s.avg_qty > 0 order by i.current_quantity/s.avg_qty asc limit 5"
+    note: "2026-11-12 修正：题目必须写明分子分母（库存÷近30天日均），否则按仓库分组算也合理"
+
+  - id: H16
+    category: date_diff
+    question: "物流平均在途天数是多少？"
+    judge: exec
+    ground_truth_sql: "select round(avg(datediff(actual_arrival_time, ship_time)), 1) days from logistics where deleted=0 and actual_arrival_time is not null"
+
+  - id: H17
+    category: null_handling
+    question: "有哪些运单还没签收，且已经超过预计到达时间 3 天以上？"
+    judge: exec
+    ground_truth_sql: "select tracking_number from logistics where deleted=0 and actual_arrival_time is null and datediff('2026-11-12', date(estimated_arrival_time)) > 3"
+
+  - id: H18
+    category: group_agg
+    question: "各信用评级的供应商数量分别是多少？"
+    judge: exec
+    ground_truth_sql: "select credit_rating, count(*) n from supplier where deleted=0 group by credit_rating"
+
+  - id: H19
+    category: flag_filter
+    question: "哪些商品有主供应商？主供应商分别是哪家？"
+    judge: exec
+    ground_truth_sql: "select p.product_code, s.name from product_supplier ps join product p on p.id=ps.product_id join supplier s on s.id=ps.supplier_id where ps.deleted=0 and ps.is_primary=1 and p.deleted=0 and s.deleted=0 limit 5"
+
+  - id: H20
+    category: consistency_check
+    question: "有没有订单的明细金额合计和订单总额对不上的？"
+    judge: exec
+    ground_truth_sql: "select count(*) from (select o.id from purchase_order o join order_detail d on d.order_id=o.id where o.deleted=0 and d.deleted=0 group by o.id, o.total_amount having abs(sum(d.subtotal) - o.total_amount) > 0.01) t"
+
+  - id: H21
+    category: time_series
+    question: "每个月的采购单数量分别是多少？"
+    judge: exec
+    ground_truth_sql: "select date_format(order_time, '%Y-%m') m, count(*) n from purchase_order where deleted=0 group by m order by m"
+
+  - id: H23
+    category: multi_hop
+    question: "A 级供应商供应的商品里，销量最高的 3 个是哪些？"
+    judge: exec
+    ground_truth_sql: "select p.product_code from product p join product_supplier ps on ps.product_id=p.id join supplier s on s.id=ps.supplier_id join sales_daily d on d.product_id=p.id where s.credit_rating='A' and s.deleted=0 and ps.deleted=0 and p.deleted=0 and d.deleted=0 group by p.id, p.product_code order by sum(d.quantity) desc limit 3"
+
+  - id: H25
+    category: negation
+    question: "有哪些商品有库存但从来没被下过单？"
+    judge: exec
+    ground_truth_sql: "select p.product_code from product p join inventory i on i.product_id=p.id where p.deleted=0 and i.deleted=0 and i.current_quantity > 0 and not exists (select 1 from order_detail d where d.product_id=p.id and d.deleted=0)"

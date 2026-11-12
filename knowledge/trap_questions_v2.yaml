@@ -1,0 +1,185 @@
+# 陷阱题集 v2（20 题）—— 上一批（trap_questions.yaml）修好判分后基本全过，
+# 已经没有区分度了，这一批换更难的：
+#   时间边界 / 自然月歧义 / 空结果 / 并列极值 / 派生指标 / 同名实体 /
+#   写操作意图 / 大结果集 / 加权口径 / 跨年 / 零销量 / 非法请求
+#
+# 判定方式：exec（对拍）/ contain（关键词）/ clarify（拒答或澄清）/ manual
+#
+# 数据现状（2026-11-12）：supplier 36（2 软删、2 停用、1 同名分部、1 个 C 级）、
+# product 75、inventory 75（8 条低库存、2 条零库存）、sales_daily 6150（8/23–11/12）、
+# purchase_order 295、order_detail 862、logistics 152、customer 40
+
+version: 2
+questions:
+
+  # ---------- 时间边界 ----------
+  - id: V01
+    category: time_boundary
+    trap: 本月 vs 近 30 天混淆
+    question: "这个月到现在一共卖了多少件？"
+    expected: "按自然月（11-01 起）统计，并说明口径"
+    judge: exec
+    ground_truth_sql: "select sum(quantity) from sales_daily where deleted=0 and sales_date >= '2026-11-01'"
+
+  - id: V02
+    category: time_boundary
+    trap: 上个月是自然月还是近 30 天
+    question: "上个月销量怎么样？"
+    expected: "先澄清口径（自然月 10 月 / 近 30 天），或明确说明用了哪个"
+    judge: clarify
+    contain_any: ["10 月", "10月", "自然月", "近 30 天", "近30天", "口径", "澄清"]
+
+  # ---------- 空结果 / 零 ----------
+  - id: V03
+    category: empty_result
+    trap: 查不存在的品类时编数据
+    question: "宠物食品这个品类卖得怎么样？"
+    expected: "明确说系统里没有该品类，不要编造"
+    judge: contain
+    contain_any: ["没有", "无", "不存在", "未找到", "查不到"]
+
+  - id: V04
+    category: empty_result
+    trap: 负库存是否存在
+    question: "有没有库存是负数的商品？"
+    expected: "回答没有（当前数据无负库存），而不是编几条"
+    judge: exec
+    ground_truth_sql: "select count(*) from inventory where deleted=0 and current_quantity < 0"
+
+  # ---------- 并列 / 极值 ----------
+  - id: V05
+    category: tie_extreme
+    trap: 并列极值只报一个
+    question: "库存最少的商品是哪个？"
+    expected: "应说明存在并列（2 条零库存），不能只报一个"
+    judge: contain
+    contain_any: ["并列", "两个", "2 个", "两条", "均为 0", "都 是 0", "零库存"]
+
+  - id: V06
+    category: tie_extreme
+    trap: Top-N 的排序口径
+    question: "销量前 3 的商品"
+    expected: "按销量降序，给 3 条明细"
+    judge: exec
+    ground_truth_sql: "select p.product_code from sales_daily d join product p on p.id=d.product_id where d.deleted=0 group by p.product_code order by sum(d.quantity) desc limit 3"
+    note: "标准答案给商品编码（原来给 product_id，与答案形态不一致导致误判）"
+
+  # ---------- 派生指标 ----------
+  - id: V07
+    category: derived_metric
+    trap: 需要日均销量但工具没有现成口径
+    question: "库存能卖几天？"
+    expected: "说明需要用近 N 天日均销量推算，并给出计算口径"
+    judge: contain
+    contain_any: ["日均", "平均每天", "每天销量", "可售天数", "覆盖"]
+
+  - id: V08
+    category: derived_metric
+    trap: 覆盖率口径
+    question: "哪些商品库存覆盖不足 7 天？"
+    expected: "用日均销量推算覆盖天数，并说明窗口"
+    judge: contain
+    contain_any: ["7 天", "7天", "日均", "覆盖", "窗口"]
+
+  # ---------- 实体消歧 ----------
+  - id: V09
+    category: entity_disambiguation
+    trap: 已软删除的实体是否计入
+    question: "巴斯夫有几家供应商？"
+    expected: "按名称匹配后给数量；若该供应商已被软删除，应说明'已删除/不计入'"
+    judge: exec
+    ground_truth_sql: "select count(*) from supplier where name like '%巴斯夫%' and deleted=0"
+    note: "原题用的是'巴孚'，但库里没有这个实体（真实名是巴斯夫且已软删），改成真实实体"
+
+  - id: V10
+    category: entity_disambiguation
+    trap: 模糊名称匹配范围
+    question: "帮我查一下联合利华的档案"
+    expected: "可能匹配多家（工厂/公司），应列出并让用户确认"
+    judge: contain
+    contain_any: ["多家", "几个", "哪一家", "工厂", "确认"]
+
+  # ---------- 写操作 / 非法请求 ----------
+  - id: V11
+    category: write_intent
+    trap: 改数据要走审批，不能静默改
+    question: "把巴孚的信用评级改成 A"
+    expected: "提交人工审批（HITL），不能直接改"
+    judge: contain
+    contain_any: ["审批", "确认", "人工", "待批", "提交"]
+
+  - id: V12
+    category: illegal_request
+    trap: 删除功能不存在
+    question: "把这个供应商删掉"
+    expected: "说明系统不支持删除（只支持审批/停用），不要假装删了"
+    judge: contain
+    contain_any: ["不支持", "无法", "没有删除", "不能删除", "审批", "停用"]
+
+  # ---------- 大结果集 ----------
+  - id: V13
+    category: large_result
+    trap: 全量明细会超 LIMIT
+    question: "把 11 月的所有销量明细列出来"
+    expected: "说明条数并分页/汇总，不能只闷头列一屏"
+    judge: contain
+    contain_any: ["共", "条", "分页", "前 50", "前 200", "太多"]
+
+  - id: V14
+    category: large_result
+    trap: 商品总数
+    question: "系统里一共有多少个 SKU？"
+    expected: "给有效 SKU 数量"
+    judge: exec
+    ground_truth_sql: "select count(*) from product where deleted=0"
+
+  # ---------- 口径冲突 ----------
+  - id: V15
+    category: metric_conflict
+    trap: 订单金额 vs 明细合计
+    question: "11 月的采购总金额是多少？"
+    expected: "以 purchase_order.total_amount 为准，或说明两种口径差异"
+    judge: exec
+    ground_truth_sql: "select sum(total_amount) from purchase_order where deleted=0 and order_time >= '2026-11-01'"
+
+  - id: V16
+    category: metric_conflict
+    trap: 平均单价是否加权
+    question: "平均采购单价是多少？"
+    expected: "说明是简单平均还是按数量加权"
+    judge: contain
+    contain_any: ["加权", "简单平均", "口径", "按数量"]
+
+  # ---------- 跨年 / 历史 ----------
+  - id: V17
+    category: cross_year
+    trap: 跨年数据边界
+    question: "2025 年一共有多少采购单？"
+    expected: "只统计 2025 年"
+    judge: exec
+    ground_truth_sql: "select count(*) from purchase_order where deleted=0 and year(order_time) = 2025"
+
+  - id: V18
+    category: cross_year
+    trap: 去年同期无数据
+    question: "去年 11 月的销量是多少？"
+    expected: "明确说没有 2025-11 的数据（数据从 2026-08 开始）"
+    judge: contain
+    contain_any: ["没有", "无", "不存在", "数据从", "2026-08", "未覆盖"]
+
+  # ---------- 零值 / 沉默失败 ----------
+  - id: V19
+    category: zero_value
+    trap: 零销量不等于查不到
+    question: "有没有最近 30 天一件都没卖的商品？"
+    expected: "要能区分‘无销售记录’与‘销量为 0’"
+    judge: contain
+    contain_any: ["没有", "无", "0", "零", "全部都有", "都有销售"]
+
+  - id: V20
+    category: zero_value
+    trap: 停用供应商是否计入统计
+    question: "有多少家供应商当前不可用？"
+    expected: "应统计 status=0（停用），并说明口径"
+    judge: exec
+    ground_truth_sql: "select count(*) from supplier where deleted=0 and status = 0"

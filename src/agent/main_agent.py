@@ -52,6 +52,9 @@ from agent.middleware_config import build_subagent_middleware, MIDDLEWARE_PROFIL
 from agent.middlewares.context_injection import ContextInjectionMiddleware
 from agent.middlewares.memory_update import MemoryUpdateMiddleware
 from agent.middlewares.sandbox_breaker import SandboxCircuitBreakerMiddleware
+from agent.middlewares.tool_loop_guard import ToolLoopGuardMiddleware
+from agent.middlewares.tool_rollback import ToolRollbackMiddleware
+from agent.middlewares.compensators import register_default_compensators
 from agent.middlewares.sandbox_health import SandboxHealthMiddleware
 from agent.middlewares.skills_sync import SkillsSyncMiddleware
 from agent.middlewares.task_state import TaskStateMiddleware
@@ -68,9 +71,11 @@ from agent.subagents.loader import (
 )
 from agent.tools.chart_generator import create_generate_chart_tool
 from agent.tools.hitl_tools import request_order_info
+from agent.tools.clarification import request_clarification
 from agent.tools.assign_skill import create_assign_skill_tool
 from agent.tools.download_sandbox_file import create_download_tool
 from agent.tools.py_exec import create_py_exec_tool
+from agent.tools.sql_tools import create_sql_tools
 from agent.tools.mcp_client import load_mcp_tools, McpToolset
 from agent.tools.web_search import web_search
 
@@ -249,6 +254,8 @@ async def create_main_agent(
     )
     # 常驻内核工具：分析类任务用它，变量留在内存里，不必反复 execute 起进程
     py_exec, py_reset = create_py_exec_tool(sandbox_backend)
+    # Text2SQL 工具族：给只读子 Agent 用（主 Agent 不直接查库，仍走委派）
+    sql_tools = create_sql_tools()
 
     # ---- Phase 4: 构建工具池 ----
     logger.info("Phase 4: 构建工具池...")
@@ -260,7 +267,8 @@ async def create_main_agent(
          if getattr(t, "name", None) not in chart_names]
         + list(precomputed.extra_mcp_tools)
         + [generate_visualization, web_search, request_order_info,
-           assign_skill, download_sandbox_file, py_exec, py_reset]
+           request_clarification, assign_skill, download_sandbox_file,
+           py_exec, py_reset] + sql_tools
     )
 
     # 工具池由多个来源拼成（多个 MCP Server + 本地工具），
@@ -322,6 +330,10 @@ async def create_main_agent(
         MemoryUpdateMiddleware(model=SUMMARY_MODEL),
         # 9. 沙箱熔断：连续沙箱错误 ≥ 阈值 → jump_to=end
         SandboxCircuitBreakerMiddleware(),
+        # 10. 工具循环熔断：同名同参连续 2 次 → 降级；同名 3 次 → 降级；5 次 → 中止
+        ToolLoopGuardMiddleware(),
+        # 11. 写操作回退：失败时逆序补偿（补偿不走审批，失败只记录不重试）
+        ToolRollbackMiddleware(backend=sandbox_backend),
         # 10. 调用限制（主 Agent）
         #
         # ⚠️ 2026-11-10 收紧：50/200 → 20/40，并补上 thread_limit。
@@ -348,12 +360,18 @@ async def create_main_agent(
 
     # ---- Phase 9: create_deep_agent ----
     logger.info("Phase 9: 创建 Deep Agent...")
+    # 登记写操作补偿函数（订单撤销 / 改单还原 / 建档回报人工）
+    try:
+        register_default_compensators()
+    except Exception as exc:  # noqa: BLE001 —— 补偿登记失败不影响主流程
+        logger.warning("登记默认补偿函数失败: %s", exc)
     agent_graph = create_deep_agent(
         model=MAIN_MODEL,
         system_prompt=system_prompt,
         skills=["/skills/main/"],
         memory=[AGENTS_MD_FILENAME],
-        tools=[web_search, assign_skill, download_sandbox_file, py_exec, py_reset],
+        tools=[web_search, assign_skill, download_sandbox_file,
+               py_exec, py_reset, request_clarification],
         subagents=subagents,
         middleware=main_middleware,
         backend=backend_factory,

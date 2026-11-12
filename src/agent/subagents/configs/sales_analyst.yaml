@@ -40,6 +40,8 @@ tools:
   - generate_visualization     # 图表生成统一入口（25 种图表按 chart_type 路由）
   - py_exec                    # ★ 常驻内核执行：变量保留，替代反复 execute 起进程
   - py_reset                   # 清空常驻内核变量（超时/状态混乱时用）
+  - sql_*                      # ★ Text2SQL 工具族：list/describe/sample/query（只读）
+  - request_clarification      # ★ 口径不明时暂停并请用户确认（别自己猜）
   - web_search                 # 网络搜索（行业大盘 / 竞品动态 / 促销节点）
 
 # 技能路径（渐进式加载，按需激活）—— 恰好一个，scope 由此推导为 "sales"
@@ -97,6 +99,11 @@ system_prompt: |
 
   ## 工作流程
 
+  0. **清单/明细/计数类问题优先用 `sql_query` 一条 SQL 拿全**
+     （不熟悉有哪些表就先 `sql_list_tables` 一次；知道要查哪几张表就直接
+     `sql_schema_overview("sales_daily,product")` 只取需要的 2~3 张，别拉全库，
+     也不要用 `meta_schema` 反复拉结构）；
+     收口工具（sales_*）用于口径固定的指标计算，两者互补，不要用关键词穷举。
   1. **定位商品**（需要时）：`product_search` / `product_query` 拿 productId、品类、单位
   2. **看异常**：`sales_anomaly` 拿骤降/激增清单（已按偏离程度排序）
   3. **看趋势与结构**：`sales_summary(dimension=...)`
