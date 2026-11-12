@@ -190,21 +190,47 @@ def get_mongo_client() -> MongoClient:
     return _mongodb_client
 
 
-def get_checkpointer() -> MongoDBSaver:
+def get_checkpointer():
     """懒加载并复用 checkpointer（进程内单例）。
 
-    支撑 Human-in-the-Loop（interrupt 状态持久化）与跨重启对话恢复。
+    支持两种后端，用环境变量 `CHECKPOINTER` 切换（默认 mongo，可随时回退）：
+
+    - `CHECKPOINTER=mongo`（默认）：MongoDBSaver，全量持久化，重启不丢。
+    - `CHECKPOINTER=redis`：RedisSaver，读写快、可设 TTL；
+      代价是**旧的 Mongo 会话读不到**（换后端等于换库），所以默认不改。
+
+    Redis 相关的环境变量：
+        REDIS_URI      默认 redis://192.168.64.132:6379/0
+        REDIS_TTL_DAYS 默认 30（checkpoint 主键过期时间，0 表示永不过期）
 
     Raises:
         ServerSelectionTimeoutError: MongoDB 不可达（超过 MONGODB_TIMEOUT_MS）
     """
     global _checkpointer
-    if _checkpointer is None:
-        _checkpointer = MongoDBSaver(
-            client=get_mongo_client(),
-            db_name=MONGODB_DB_NAME,
-            checkpoint_collection_name=MONGODB_CHECKPOINT_COLLECTION,
-        )
+    if _checkpointer is not None:
+        return _checkpointer
+
+    backend = (os.getenv("CHECKPOINTER") or "mongo").strip().lower()
+
+    if backend == "redis":
+        from langgraph.checkpoint.redis import RedisSaver
+
+        redis_uri = os.getenv("REDIS_URI", "redis://192.168.64.132:6379/0")
+        ttl_days = int(os.getenv("REDIS_TTL_DAYS", "30") or 0)
+        ttl = {"default_ttl": ttl_days * 24 * 60} if ttl_days > 0 else None
+        import redis as _redis
+
+        client = _redis.Redis.from_url(redis_uri, socket_connect_timeout=8, socket_timeout=15)
+        saver = RedisSaver(redis_client=client, ttl=ttl)
+        saver.setup()          # 建索引（幂等）
+        _checkpointer = saver
+        return _checkpointer
+
+    _checkpointer = MongoDBSaver(
+        client=get_mongo_client(),
+        db_name=MONGODB_DB_NAME,
+        checkpoint_collection_name=MONGODB_CHECKPOINT_COLLECTION,
+    )
     return _checkpointer
 
 # ---------- 第三方框架补丁 ----------
