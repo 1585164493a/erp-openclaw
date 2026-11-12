@@ -1,0 +1,496 @@
+# 意图评测集（intent cases）
+#
+# 用途：把"意图理解对不对"变成可判定的规格 —— 只要求模型输出意图 JSON，不跑整个 agent。
+# 一条 = 问题 + 期望域 + 期望槽位 + 是否该澄清。
+#
+# 字段：
+#   domain: 期望路由到哪个子 Agent；none = 主 Agent 自己处理（问候/通用知识）
+#   intent: query（单值查询）/ analysis（多步分析）/ action（写操作）/ clarify（信息不足）/ refuse（不可回答）
+#   slots: 期望抽取到的槽位；null 表示该项"应该识别为缺失"
+#     time_window  自然语言 -> 具体窗口（如 "2026-11 自然月"）
+#     metric       指标名
+#     dimension    分组维度（channel / category / supplier / warehouse ...）
+#   should_clarify: 是否应当在动手前先向用户澄清（口径/范围缺失时为 true）
+#   note: 判定理由（给 review 用）
+#
+# 标注原则：以 knowledge/metrics.md 的口径为准，**不要拿当前 agent 的行为当标注**。
+
+version: 1
+cases:
+
+  # ---------- 域路由：销售 ----------
+  - id: I01
+    q: "11 月各渠道的销售额占比是多少？"
+    domain: sales-analyst
+    intent: analysis
+    slots: {time_window: "2026-11 自然月", metric: "销售额占比", dimension: channel}
+    should_clarify: false
+    note: '窗口和维度都明确'
+
+  - id: I02
+    q: "上个月销量怎么样？"
+    domain: sales-analyst
+    intent: analysis
+    slots: {time_window: null, metric: 销量, dimension: null}
+    should_clarify: true
+    note: '"上个月"是自然月还是滚动 30 天不明确'
+
+  - id: I03
+    q: "最近卖得最好的商品是哪个？"
+    domain: sales-analyst
+    intent: analysis
+    slots: {time_window: null, metric: 销量, dimension: product}
+    should_clarify: true
+    note: '"最近"没说窗口；"最好"是销量还是金额'
+
+  - id: I04
+    q: "为什么洗衣液销量下降了？"
+    domain: sales-analyst
+    intent: analysis
+    slots: {time_window: null, metric: 销量, dimension: product}
+    should_clarify: false
+    note: '归因类，可先给多角度拆解'
+
+  # ---------- 域路由：库存/物流 ----------
+  - id: I05
+    q: "哪些商品库存低于安全库存？"
+    domain: inventory-logistics
+    intent: query
+    slots: {time_window: null, metric: 库存安全度, dimension: product}
+    should_clarify: false
+
+  - id: I06
+    q: "库存还能卖几天？"
+    domain: inventory-logistics
+    intent: analysis
+    slots: {time_window: "近 30 天", metric: 库存覆盖天数, dimension: product}
+    should_clarify: false
+    note: '口径固定（当前库存÷近30天日均）'
+
+  - id: I07
+    q: "物流平均在途天数是多少？"
+    domain: inventory-logistics
+    intent: query
+    slots: {time_window: null, metric: 在途天数, dimension: null}
+    should_clarify: false
+
+  - id: I08
+    q: "有哪些运单还没签收？"
+    domain: inventory-logistics
+    intent: query
+    slots: {time_window: null, metric: 未签收, dimension: null}
+    should_clarify: false
+
+  # ---------- 域路由：采购分析（易错） ----------
+  - id: I09
+    q: "每个月的采购单数量分别是多少？"
+    domain: procurement-analyst
+    intent: analysis
+    slots: {time_window: "全部历史", metric: 采购单数量, dimension: month}
+    should_clarify: false
+    note: '★ 实测被误派给 procurement-order（写 Agent，无聚合能力）'
+
+  - id: I10
+    q: "各家供应商的平均交付周期是多少天？"
+    domain: procurement-analyst
+    intent: analysis
+    slots: {time_window: null, metric: 交付周期, dimension: supplier}
+    should_clarify: false
+
+  - id: I11
+    q: "哪个供应商报价最便宜？"
+    domain: procurement-analyst
+    intent: analysis
+    slots: {time_window: null, metric: 报价, dimension: supplier}
+    should_clarify: false
+
+  - id: I12
+    q: "11 月的采购总金额是多少？"
+    domain: procurement-analyst
+    intent: query
+    slots: {time_window: "2026-11 自然月", metric: 采购金额, dimension: null}
+    should_clarify: false
+
+  # ---------- 域路由：主数据查询 ----------
+  - id: I13
+    q: "系统里一共有多少个 SKU？"
+    domain: master-data
+    intent: query
+    slots: {time_window: null, metric: 商品数量, dimension: null}
+    should_clarify: false
+
+  - id: I14
+    q: "查一下巴斯夫的档案"
+    domain: master-data
+    intent: query
+    slots: {time_window: null, metric: null, dimension: null}
+    should_clarify: false
+
+  - id: I15
+    q: "客户类型都有哪些含义？"
+    domain: master-data
+    intent: query
+    slots: {time_window: null, metric: null, dimension: null}
+    should_clarify: false
+
+  # ---------- 读 vs 写（最贵的一类错误） ----------
+  - id: I16
+    q: "帮我给巴斯夫下一张采购单"
+    domain: procurement-order
+    intent: action
+    slots: {time_window: null, metric: null, dimension: null}
+    should_clarify: false
+    note: '★ 缺商品清单也要先委派写 Agent，由它索要（不要自己先问一轮）'
+
+  - id: I17
+    q: "把这个采购单取消掉"
+    domain: procurement-order
+    intent: action
+    slots: {time_window: null, metric: null, dimension: null}
+    should_clarify: false
+
+  - id: I18
+    q: "新增一个供应商，叫测试供应商"
+    domain: master-data-maintain
+    intent: action
+    slots: {time_window: null, metric: null, dimension: null}
+    should_clarify: false
+
+  - id: I19
+    q: "把巴斯夫的信用评级改成 A"
+    domain: master-data-maintain
+    intent: action
+    slots: {time_window: null, metric: null, dimension: null}
+    should_clarify: false
+    note: '写操作，走审批'
+
+  - id: I20
+    q: "查一下巴斯夫这家供应商"
+    domain: master-data
+    intent: query
+    slots: {time_window: null, metric: null, dimension: null}
+    should_clarify: false
+    note: '★ 与 I19/I18 只差动词，必须路由到只读'
+
+  # ---------- 不委派（主 Agent 自理） ----------
+  - id: I21
+    q: "你好"
+    domain: none
+    intent: query
+    slots: {time_window: null, metric: null, dimension: null}
+    should_clarify: false
+
+  - id: I22
+    q: "你能做什么？"
+    domain: none
+    intent: query
+    slots: {time_window: null, metric: null, dimension: null}
+    should_clarify: false
+
+  - id: I23
+    q: "什么是安全库存？"
+    domain: none
+    intent: query
+    slots: {time_window: null, metric: null, dimension: null}
+    should_clarify: false
+    note: '通用知识，走 web_search'
+
+  - id: I24
+    q: "VMI 和 JIT 的区别是什么？"
+    domain: none
+    intent: query
+    slots: {time_window: null, metric: null, dimension: null}
+    should_clarify: false
+
+  # ---------- 不可回答（拒答） ----------
+  - id: I25
+    q: "上个月的退货率是多少？"
+    domain: none
+    intent: refuse
+    slots: {time_window: "2026-10 自然月", metric: 退货率, dimension: null}
+    should_clarify: false
+    note: '系统无退货数据，应直接说明'
+
+  - id: I26
+    q: "客户满意度怎么样？"
+    domain: none
+    intent: refuse
+    slots: {time_window: null, metric: 满意度, dimension: null}
+    should_clarify: false
+    note: '无该字段'
+
+  - id: I27
+    q: "下个月的销量预测是多少？"
+    domain: none
+    intent: refuse
+    slots: {time_window: "下个月", metric: 预测, dimension: null}
+    should_clarify: false
+    note: '无预测能力，不能编'
+
+  # ---------- 槽位：时间窗口陷阱 ----------
+  - id: I28
+    q: "11 月的采购总额是多少？"
+    domain: procurement-analyst
+    intent: query
+    slots: {time_window: "2026-11 自然月", metric: 采购金额, dimension: null}
+    should_clarify: false
+    note: '★ 实测被算成 2025-11（年份没识别）'
+
+  - id: I29
+    q: "去年 11 月的销量是多少？"
+    domain: sales-analyst
+    intent: query
+    slots: {time_window: "2025-11 自然月", metric: 销量, dimension: null}
+    should_clarify: false
+    note: '明确是去年，数据没覆盖 → 结果应说明无数据'
+
+  - id: I30
+    q: "11 月销量比 10 月增长了多少？"
+    domain: sales-analyst
+    intent: analysis
+    slots: {time_window: "2026-11 vs 2026-10", metric: 销量增长率, dimension: null}
+    should_clarify: true
+    note: '★ 本月未结束 → 需要确认是否用同窗口对比（11-01~12 vs 10-01~12）'
+
+  - id: I31
+    q: "这个月到现在卖了多少？"
+    domain: sales-analyst
+    intent: query
+    slots: {time_window: "2026-11 月初至今", metric: 销量, dimension: null}
+    should_clarify: false
+
+  # ---------- 槽位：指标歧义 ----------
+  - id: I32
+    q: "平均采购单价是多少？"
+    domain: procurement-analyst
+    intent: analysis
+    slots: {time_window: null, metric: 采购单价, dimension: null}
+    should_clarify: true
+    note: '简单平均 vs 按数量加权，口径不同结论不同'
+
+  - id: I33
+    q: "库存周转最快的前 5 个商品"
+    domain: inventory-logistics
+    intent: analysis
+    slots: {time_window: "近 30 天", metric: 库存周转天数, dimension: product}
+    should_clarify: false
+
+  - id: I34
+    q: "各品类的目标达成率"
+    domain: sales-analyst
+    intent: analysis
+    slots: {time_window: null, metric: 目标达成率, dimension: category}
+    should_clarify: true
+    note: '月份没说；本月未结束还要确认是否按时间进度对比'
+
+  # ---------- 域边界（易混） ----------
+  - id: I35
+    q: "奥妙洗衣液现在还有多少库存？"
+    domain: inventory-logistics
+    intent: query
+    slots: {time_window: null, metric: 库存, dimension: product}
+    should_clarify: false
+    note: '商品 + 库存 → 库存域，不是主数据'
+
+  - id: I36
+    q: "奥妙洗衣液是什么规格？"
+    domain: master-data
+    intent: query
+    slots: {time_window: null, metric: 商品规格, dimension: product}
+    should_clarify: false
+    note: '商品属性 → 主数据'
+
+  - id: I37
+    q: "巴斯夫那边的报价贵不贵？"
+    domain: procurement-analyst
+    intent: analysis
+    slots: {time_window: null, metric: 报价水平, dimension: supplier}
+    should_clarify: false
+    note: '供应商 + 报价 → 采购分析'
+
+  - id: I38
+    q: "这一单现在什么状态？PO202610310110"
+    domain: procurement-order
+    intent: query
+    slots: {time_window: null, metric: 订单状态, dimension: null}
+    should_clarify: false
+    note: '单号明确；查单状态属订单执行域'
+
+  - id: I39
+    q: "最近采购价格有什么变化趋势？"
+    domain: procurement-analyst
+    intent: analysis
+    slots: {time_window: null, metric: 采购价趋势, dimension: product}
+    should_clarify: true
+    note: '"最近"没说窗口'
+
+  # ---------- 实体消歧 ----------
+  - id: I40
+    q: "巴孚有几家供应商？"
+    domain: master-data
+    intent: query
+    slots: {time_window: null, metric: 供应商数量, dimension: supplier}
+    should_clarify: true
+    note: '★ 库里没有"巴孚"（真实名是巴斯夫且已软删）→ 应先确认实体'
+
+  - id: I41
+    q: "联合利华有几家工厂？"
+    domain: master-data
+    intent: query
+    slots: {time_window: null, metric: 供应商数量, dimension: supplier}
+    should_clarify: false
+    note: '数据里有多家"联合利华"工厂，按名称匹配即可'
+
+  # ---------- 组合意图 ----------
+  - id: I42
+    q: "先看下哪些商品库存不足，再算一下缺口的金额"
+    domain: inventory-logistics
+    intent: analysis
+    slots: {time_window: null, metric: 库存缺口, dimension: product}
+    should_clarify: false
+    note: '两步骤但同域，可一次委派'
+
+  - id: I43
+    q: "把库存不足的商品按供应商分组，看看哪家供应商问题最多"
+    domain: inventory-logistics
+    intent: analysis
+    slots: {time_window: null, metric: 库存不足商品数, dimension: supplier}
+    should_clarify: false
+    note: '涉及供应商但主体是库存 → 库存域'
+
+  - id: I44
+    q: "11 月销量最好的品类，它的主要供应商是谁？"
+    domain: sales-analyst
+    intent: analysis
+    slots: {time_window: "2026-11 自然月", metric: 销量, dimension: category}
+    should_clarify: false
+    note: '主问题是销量，供应商是附加信息（可跨域取）'
+
+  # ---------- 含糊/缺字段 ----------
+  - id: I45
+    q: "帮我查一下"
+    domain: none
+    intent: clarify
+    slots: {time_window: null, metric: null, dimension: null}
+    should_clarify: true
+    note: '完全没信息，必须问'
+
+  - id: I46
+    q: "销量多少？"
+    domain: sales-analyst
+    intent: clarify
+    slots: {time_window: null, metric: 销量, dimension: null}
+    should_clarify: true
+    note: '缺时间窗口和范围'
+
+  - id: I47
+    q: "库存不足的都有哪些？"
+    domain: inventory-logistics
+    intent: query
+    slots: {time_window: null, metric: 库存安全度, dimension: product}
+    should_clarify: false
+    note: '口径固定（低于安全库存），可直接答'
+
+  # ---------- 写操作缺字段 ----------
+  - id: I48
+    q: "帮我下一张采购单"
+    domain: procurement-order
+    intent: action
+    slots: {time_window: null, metric: null, dimension: null}
+    should_clarify: false
+    note: '★ 直接委派写 Agent，由它用 request_order_info 索要字段'
+
+  - id: I49
+    q: "新建一个客户，叫杭州测试贸易"
+    domain: master-data-maintain
+    intent: action
+    slots: {time_window: null, metric: null, dimension: null}
+    should_clarify: false
+
+  - id: I50
+    q: "把这款商品建到系统里"
+    domain: master-data-maintain
+    intent: action
+    slots: {time_window: null, metric: null, dimension: null}
+    should_clarify: true
+    note: '没说哪款商品、也没给编码（商品编码必须用户提供）'
+
+  # ---------- 权限/边界 ----------
+  - id: I51
+    q: "把所有供应商的删除标记改成 1"
+    domain: none
+    intent: refuse
+    slots: {time_window: null, metric: null, dimension: null}
+    should_clarify: false
+    note: '批量改数据，系统不支持，应拒绝并说明'
+
+  - id: I52
+    q: "导出所有客户的手机号"
+    domain: master-data
+    intent: query
+    slots: {time_window: null, metric: 客户手机号, dimension: customer}
+    should_clarify: false
+    note: '属主数据查询；是否脱敏按系统能力说明'
+
+  # ---------- 模糊表述 ----------
+  - id: I53
+    q: "最近生意怎么样？"
+    domain: sales-analyst
+    intent: clarify
+    slots: {time_window: null, metric: null, dimension: null}
+    should_clarify: true
+
+  - id: I54
+    q: "帮我看看库存"
+    domain: inventory-logistics
+    intent: clarify
+    slots: {time_window: null, metric: 库存, dimension: null}
+    should_clarify: true
+    note: '看全部库存？还是只看异常的？'
+
+  - id: I55
+    q: "这个商品卖得怎么样？SKU HFS-400-02"
+    domain: sales-analyst
+    intent: analysis
+    slots: {time_window: null, metric: 销量, dimension: product}
+    should_clarify: true
+    note: '实体明确，但时间窗口没说'
+
+  # ---------- 跨年/历史 ----------
+  - id: I56
+    q: "2025 年一共有多少采购单？"
+    domain: procurement-analyst
+    intent: query
+    slots: {time_window: "2025 全年", metric: 采购单数量, dimension: null}
+    should_clarify: false
+
+  - id: I57
+    q: "去年的采购单和今年比怎么样？"
+    domain: procurement-analyst
+    intent: analysis
+    slots: {time_window: "2025 vs 2026", metric: 采购单数量, dimension: null}
+    should_clarify: false
+
+  # ---------- 计数类 ----------
+  - id: I58
+    q: "一共有多少家供应商？"
+    domain: master-data
+    intent: query
+    slots: {time_window: null, metric: 供应商数量, dimension: null}
+    should_clarify: false
+    note: '是否含软删/停用需口径说明'
+
+  - id: I59
+    q: "有多少家供应商当前不可用？"
+    domain: master-data
+    intent: query
+    slots: {time_window: null, metric: 停用供应商数量, dimension: null}
+    should_clarify: false
+
+  - id: I60
+    q: "哪些商品有多家供应商供货？"
+    domain: master-data
+    intent: query
+    slots: {time_window: null, metric: 供应商数量, dimension: product}
+    should_clarify: true
+    note: '"多"的门槛没说（≥2 还是 >2）'
