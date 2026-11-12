@@ -371,6 +371,17 @@ async def stream_chat_response(
     collected_content = ""
     # 工具调用栈，支持嵌套工具调用（主代理调 task → 子代理调 generate_chart）
     tool_call_stack = []
+
+    # 对话切换时清空常驻内核（同一对话内多轮保留变量，跨对话不留痕）
+    try:
+        from agent.backends.sandbox_manager import SANDBOX_BACKENDS
+        from agent.backends.kernel_client import reset_kernel_if_new_thread
+
+        _sb = SANDBOX_BACKENDS.get(user_id)
+        if _sb is not None:
+            reset_kernel_if_new_thread(user_id, thread_id, _sb)
+    except Exception:  # noqa: BLE001 —— 内核清理失败不能影响对话
+        pass
     # 子 Agent 命名空间 -> 可读名字（首次见到该 ns 时绑定）
     subagent_source_cache: dict = {}
     # 同一条 AIMessage 里可能并行发起多个工具调用，靠 tool_call_chunks 的

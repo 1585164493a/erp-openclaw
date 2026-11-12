@@ -12,6 +12,8 @@ OpenSandbox 沙箱的初始化与文件播种模块。
 """
 from datetime import timedelta
 from pathlib import Path
+import os
+import time
 from typing import List, Tuple
 
 from opensandbox import SandboxSync
@@ -45,7 +47,11 @@ def setup_sandbox(config, sandbox_id=None, image=None) -> OpenSandboxBackend:
 
     if not sandbox_id:
         if not image:
-            image = "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/code-interpreter:v1.0.2"
+            # 优先用自建镜像（依赖已烤进去，省掉每次几分钟的 pip install）；
+            # 没配环境变量时退回官方镜像，行为与原来一致。
+            image = os.getenv("OPENSANDBOX_IMAGE") or (
+                "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/code-interpreter:v1.0.2"
+            )
 
         print(f"[INFO] 正在创建新沙箱，使用镜像: {image}")
         sandbox = SandboxSync.create(
@@ -80,7 +86,43 @@ def setup_sandbox(config, sandbox_id=None, image=None) -> OpenSandboxBackend:
     # 创建 Python venv + 预装第三方依赖
     _create_venv(backend)
 
+    # 拉起常驻代码执行服务（py_exec 工具的后端，避免每次起进程 + 重复 import）
+    _start_kernel(backend)
+
     return backend
+
+
+_KERNEL_PATH = "/opt/kernel/kernel_server.py"
+_KERNEL_LOG = "/opt/kernel/kernel.log"
+_KERNEL_HEALTH = "curl -s -m 2 http://127.0.0.1:9000/health"
+
+
+def _start_kernel(backend: OpenSandboxBackend) -> None:
+    """把常驻执行服务传进沙箱并拉起。用标准库实现，无额外依赖。
+
+    失败不影响主流程：Agent 仍有 execute/read_file 这些原生工具，只是慢一点。
+    """
+    try:
+        src = Path(__file__).with_name("kernel_server.py")
+        if not src.exists():
+            return
+        backend.execute("mkdir -p /opt/kernel")
+        backend.upload_files([(_KERNEL_PATH, src.read_bytes())])
+        # 沙箱复用场景下先清掉旧进程，保证加载的是最新代码
+        backend.execute("pkill -f kernel_server.py >/dev/null 2>&1 || true")
+        backend.execute(
+            f"nohup {_VENV_PATH}/bin/python3 {_KERNEL_PATH} > {_KERNEL_LOG} 2>&1 &",
+            timeout=20,
+        )
+        for _ in range(12):
+            r = backend.execute(_KERNEL_HEALTH)
+            if r.exit_code == 0 and "ok" in (r.output or ""):
+                print("[INFO] 代码内核已就绪: 127.0.0.1:9000")
+                return
+            time.sleep(0.5)
+        print("[WARNING] 代码内核启动超时，py_exec 暂时不可用（其它能力不受影响）")
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARNING] 代码内核启动失败（不影响主流程）: {e}")
 
 
 # skills 运行时依赖的目录（需在沙箱中预创建）
@@ -90,7 +132,7 @@ _SKILL_DIRS = ["/analysis/temp"]
 _VENV_PATH = "/opt/skills-venv"
 _VENV_PIP = f"{_VENV_PATH}/bin/pip"
 # skills 运行时需要的 Python 第三方包
-_PREINSTALL_PACKAGES = ["numpy", "pandas", "matplotlib", "requests", "beautifulsoup4"]
+_PREINSTALL_PACKAGES = ["numpy", "pandas", "matplotlib", "requests", "beautifulsoup4", "openpyxl"]
 # 包名 → import 名（判定依赖是否真的可用时用 import 名，二者不一定相同）
 _IMPORT_NAMES = {
     "beautifulsoup4": "bs4",

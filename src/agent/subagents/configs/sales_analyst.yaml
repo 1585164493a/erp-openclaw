@@ -38,6 +38,8 @@ tools:
   - product_query              # 商品分页查询：name/category/supplier_id 均可选
   - product_search             # 商品按名称搜索（返回数组）
   - generate_visualization     # 图表生成统一入口（25 种图表按 chart_type 路由）
+  - py_exec                    # ★ 常驻内核执行：变量保留，替代反复 execute 起进程
+  - py_reset                   # 清空常驻内核变量（超时/状态混乱时用）
   - web_search                 # 网络搜索（行业大盘 / 竞品动态 / 促销节点）
 
 # 技能路径（渐进式加载，按需激活）—— 恰好一个，scope 由此推导为 "sales"
@@ -129,6 +131,7 @@ system_prompt: |
   **铁律**：
   - 用户要清单就给清单。**禁止用"共 75 条""10 个品类"这类汇总数字代替明细**；
     条数多就分页给前 N 条 + 说明如何看全部，而不是只给统计。
+  - **清单类查询用分页参数翻页（page/size），禁止用名称关键词穷举试探**；拿不全就说"接口不支持全量拉取"。
   - **报告路径只能引用 `write_file` 真实写入成功的路径**。没写过文件就绝对不要提路径——
     编一条 `/analysis/report_xxx.md` 是严重幻觉，比不给路径更糟。
 

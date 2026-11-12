@@ -75,6 +75,10 @@ RECORD_CODE = re.compile(r"\b[A-Z]{2,}[A-Z0-9]*-\d{2,}\b")   # 形如 HFS-750-01
 REPORT_PATH = re.compile(r"/analysis/report_[A-Za-z0-9_\-]+\.md")
 MIN_RECORDS = 3      # 问清单时，答案里至少要出现的记录编号个数
 
+# 工具穷举阈值：实测一次「都有哪些供应商」被拆成 48 次 supplier_query
+# （用"公司/上海/集团"这类关键词挨个猜），单轮 134 秒。同一工具超过这个次数即判异常。
+TOOL_SPAM_THRESHOLD = 15
+
 
 def _score_id(trace_id: str, name: str) -> str:
     """幂等键 = trace_id + 分名，转成合法 UUID。
@@ -104,11 +108,25 @@ def lf_post(path: str, body: dict) -> tuple[int, dict]:
 
 
 # ---------------------------------------------------------------- 事实提取
-def fetch_observations(trace_id: str) -> list[dict]:
-    try:
-        return lf_get("/api/public/observations", {"traceId": trace_id, "limit": 100}).get("data") or []
-    except Exception:  # noqa: BLE001
-        return []
+def fetch_observations(trace_id: str, max_pages: int = 10) -> list[dict]:
+    """取一条 trace 的全部观测。
+
+    ⚠️ 只拉一页（100 条）会**低估工具调用次数**：实测一条 493 个观测的 trace，
+    第一页只看到 12 个工具，真实是 59 个 —— `tool_spam` 因此永远不触发。
+    """
+    out: list[dict] = []
+    for page in range(1, max_pages + 1):
+        try:
+            data = lf_get("/api/public/observations",
+                          {"traceId": trace_id, "limit": 100, "page": page}).get("data") or []
+        except Exception:  # noqa: BLE001
+            break
+        if not data:
+            break
+        out.extend(data)
+        if len(data) < 100:
+            break
+    return out
 
 
 def _msg_text(msg: Any) -> str:
@@ -356,11 +374,15 @@ def run_rules(f: dict) -> tuple[list[dict], list[str]]:
         add("empty_output", 0, "BOOLEAN")
 
     # R6 答非所问：用户要清单，答案里却没有具体记录
+    # 记录有三种常见形态，都算"给了明细"：编号（SKU-001）、表格行（| … |）、条目（- …）
     answer = f["answer_text"]
     records = set(RECORD_CODE.findall(answer))
-    if LIST_INTENT.search(f["question_text"]) and len(records) < MIN_RECORDS:
+    table_rows = [ln for ln in answer.splitlines() if ln.strip().startswith("|")]
+    bullets = [ln for ln in answer.splitlines() if ln.strip().startswith(("- ", "* "))]
+    listed = len(records) + max(0, len(table_rows) - 2) + len(bullets)
+    if LIST_INTENT.search(f["question_text"]) and listed < MIN_RECORDS:
         add("answer_has_records", 1, "BOOLEAN",
-            f"问清单但只有 {len(records)} 个记录编号（要求 ≥{MIN_RECORDS}）")
+            f"问清单但只列出 {listed} 条明细（编号/表格行/条目，要求 ≥{MIN_RECORDS}）")
         reasons.append("no_records")
     else:
         add("answer_has_records", 0, "BOOLEAN")
@@ -438,6 +460,19 @@ def run_rules(f: dict) -> tuple[list[dict], list[str]]:
             reasons.append("approval_mismatch")
         else:
             add("post_approval_consistent", 1, "BOOLEAN")
+
+    # ============ R12 工具穷举 ============
+    # 同一工具被反复调用（典型：清单类问题不知道分页，改用关键词挨个猜）
+    counts: dict[str, int] = {}
+    for name in (f.get("tools") or []):
+        counts[name] = counts.get(name, 0) + 1
+    spam = {n: c for n, c in counts.items() if c >= TOOL_SPAM_THRESHOLD}
+    if spam:
+        detail = "; ".join(f"{n} x{c}" for n, c in sorted(spam.items(), key=lambda kv: -kv[1]))
+        add("tool_spam", 1, "BOOLEAN", detail[:160])
+        reasons.append("tool_spam")
+    else:
+        add("tool_spam", 0, "BOOLEAN")
 
     return scores, reasons
 
@@ -598,7 +633,7 @@ def main() -> int:
                   "slow_trace", "empty_output", "quality_score",
                   "answer_has_records", "hallucinated_path",
                   "approval_asked", "approval_payload_complete",
-                  "approval_outcome", "post_approval_consistent"}
+                  "approval_outcome", "post_approval_consistent", "tool_spam"}
     for t in reversed(traces):                       # 从旧到新
         existing = _fetch_scores(t.get("id"))
         seen = {s.get("name") for s in existing if isinstance(s, dict)}

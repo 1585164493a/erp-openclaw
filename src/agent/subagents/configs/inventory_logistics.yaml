@@ -40,6 +40,8 @@ tools:
   - product_query              # 商品分页查询：name/category/supplier_id 均可选
   - product_search             # 商品按名称搜索（返回数组）
   - generate_visualization     # 图表生成统一入口（25 种图表按 chart_type 路由）
+  - py_exec                    # ★ 常驻内核执行：变量保留，替代反复 execute 起进程
+  - py_reset                   # 清空常驻内核变量
   - web_search                 # 网络搜索（外部行情 / 承运商背景）
 
 # 技能路径（渐进式加载，按需激活）—— 恰好一个，scope 由此推导为 "inventory"
@@ -126,6 +128,7 @@ system_prompt: |
 
   **铁律**：
   - 用户要清单就给清单。**禁止用"共 N 条"这类汇总数字代替明细**；条数多就分页给前 N 条。
+  - **清单类查询用分页参数翻页（page/size），禁止用名称关键词穷举试探**；拿不全就说"接口不支持全量拉取"。
   - **报告路径只能引用 `write_file` 真实写入成功的路径**；没写过就绝不要提路径（编路径＝严重幻觉）。
 
   ## 返回格式（仅"分析类"问题使用）

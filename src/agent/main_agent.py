@@ -70,6 +70,7 @@ from agent.tools.chart_generator import create_generate_chart_tool
 from agent.tools.hitl_tools import request_order_info
 from agent.tools.assign_skill import create_assign_skill_tool
 from agent.tools.download_sandbox_file import create_download_tool
+from agent.tools.py_exec import create_py_exec_tool
 from agent.tools.mcp_client import load_mcp_tools, McpToolset
 from agent.tools.web_search import web_search
 
@@ -246,6 +247,8 @@ async def create_main_agent(
     download_sandbox_file = create_download_tool(
         sandbox_backend, DOWNLOAD_DIR, store=get_store()
     )
+    # 常驻内核工具：分析类任务用它，变量留在内存里，不必反复 execute 起进程
+    py_exec, py_reset = create_py_exec_tool(sandbox_backend)
 
     # ---- Phase 4: 构建工具池 ----
     logger.info("Phase 4: 构建工具池...")
@@ -257,7 +260,7 @@ async def create_main_agent(
          if getattr(t, "name", None) not in chart_names]
         + list(precomputed.extra_mcp_tools)
         + [generate_visualization, web_search, request_order_info,
-           assign_skill, download_sandbox_file]
+           assign_skill, download_sandbox_file, py_exec, py_reset]
     )
 
     # 工具池由多个来源拼成（多个 MCP Server + 本地工具），
@@ -350,7 +353,7 @@ async def create_main_agent(
         system_prompt=system_prompt,
         skills=["/skills/main/"],
         memory=[AGENTS_MD_FILENAME],
-        tools=[web_search, assign_skill, download_sandbox_file],
+        tools=[web_search, assign_skill, download_sandbox_file, py_exec, py_reset],
         subagents=subagents,
         middleware=main_middleware,
         backend=backend_factory,
