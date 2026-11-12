@@ -57,6 +57,7 @@ from agent.middlewares.tool_rollback import ToolRollbackMiddleware
 from agent.middlewares.context_compaction import ToolResultCompactionMiddleware
 from agent.middlewares.context_summary import ContextSummarizerMiddleware
 from agent.middlewares.compensators import register_default_compensators
+from agent.prompt_trim import install_prompt_trims
 from agent.middlewares.sandbox_health import SandboxHealthMiddleware
 from agent.middlewares.skills_sync import SkillsSyncMiddleware
 from agent.middlewares.task_state import TaskStateMiddleware
@@ -366,6 +367,9 @@ async def create_main_agent(
 
     # ---- Phase 9: create_deep_agent ----
     logger.info("Phase 9: 创建 Deep Agent...")
+    # 精简框架默认的工具描述（task 6.5K→200 字符、write_todos 914→26 token）
+    # 必须在 create_deep_agent 之前，它是往中间件里注入默认描述的
+    install_prompt_trims()
     # 登记写操作补偿函数（订单撤销 / 改单还原 / 建档回报人工）
     try:
         register_default_compensators()
