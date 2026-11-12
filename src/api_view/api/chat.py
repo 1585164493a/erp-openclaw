@@ -396,7 +396,16 @@ async def stream_chat_response(
         current_input = Command(resume=resume_data)
     else:
         # 初始模式：新建展示消息，用普通消息作为 input
-        current_input = {"messages": [{"role": "user", "content": message}]}
+        # 当前时间跟**用户消息**一起传，不放进 system 前缀 ——
+        # system/工具定义/历史原样不变，prompt cache 才能命中（否则每轮时间戳不同，前缀全失效）
+        from datetime import datetime, timedelta, timezone
+
+        _now = datetime.now(timezone(timedelta(hours=8)))
+        message_for_model = (
+            f"{message}\n\n【当前时间】{_now.strftime('%Y-%m-%d %H:%M')}"
+            f"（{_now.strftime('%A')}，UTC+8）—— 凡'本月/上个月/最近'请按此推算并注明口径"
+        )
+        current_input = {"messages": [{"role": "user", "content": message_for_model}]}
         display_messages = [
             {
                 "id": f"user-{uuid.uuid4()}",

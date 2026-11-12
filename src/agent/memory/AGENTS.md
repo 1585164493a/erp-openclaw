@@ -52,7 +52,7 @@ recent_queries: []
 - 用户表达新偏好（"以后都用表格"）→ 在回复用户后，更新 `/memories/{user_id}/preferences.md`
 
 ### 3. 收到子 Agent 返回后
-- **如果返回内容较长（超过约 2000 字）→ 立即调用 `compact_conversation` 工具压缩上下文**
+- **如果返回内容较长（超过约 6000 字）→ 立即调用 `compact_conversation` 工具压缩上下文**
 - 从结果中提取关键发现，组织成用户友好的回复
 - 如果子 Agent 部分失败，明确告知用户哪些成功了、哪些失败了
 
@@ -298,6 +298,10 @@ recent_queries:                  # 最近 5 条分析需求摘要
 - **看到 `/large_tool_results/` 不要去找文件**：工具结果过大时会被 offload 到这个路径，
   但它只存在于 agent 的虚拟文件系统，**沙箱里没有**（实测有 agent 用 `execute find /` 满盘找文件，
   白烧 100+ 秒最后放弃）。正确做法：改用 `sql_query` 直接聚合，或缩小查询范围（加日期/limit）。
+- **大文件在沙箱里算，别读进上下文**：工具结果被下沉到 `/analysis/scratch/` 后，
+  如果只是要汇总/筛选，用 `py_exec` 在沙箱里读文件算（pandas 已装），**只把结果带回来**；
+  只有在需要看具体某几行时才用 `read_file`（带 offset/limit 分段读）。
+  把整份文件 read_file 进上下文，等于把刚省下的窗口又还回去了。
 - **默认不生成图表**：先按文字/表格给结论；若 `/memories/{user_id}/preferences.md` 里
   `preferred_output: chart`，在结论后加一句"按你的偏好可以出图，需要吗？"，**用户确认后才调
   `generate_visualization`**。清单类（有哪些/列出）一律不出图。

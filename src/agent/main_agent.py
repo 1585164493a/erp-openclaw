@@ -54,6 +54,8 @@ from agent.middlewares.memory_update import MemoryUpdateMiddleware
 from agent.middlewares.sandbox_breaker import SandboxCircuitBreakerMiddleware
 from agent.middlewares.tool_loop_guard import ToolLoopGuardMiddleware
 from agent.middlewares.tool_rollback import ToolRollbackMiddleware
+from agent.middlewares.context_compaction import ToolResultCompactionMiddleware
+from agent.middlewares.context_summary import ContextSummarizerMiddleware
 from agent.middlewares.compensators import register_default_compensators
 from agent.middlewares.sandbox_health import SandboxHealthMiddleware
 from agent.middlewares.skills_sync import SkillsSyncMiddleware
@@ -334,6 +336,10 @@ async def create_main_agent(
         ToolLoopGuardMiddleware(),
         # 11. 写操作回退：失败时逆序补偿（补偿不走审批，失败只记录不重试）
         ToolRollbackMiddleware(backend=sandbox_backend),
+        # 12. 上下文压缩：日志正则压缩 + 超大结果下沉到沙箱可读目录
+        ToolResultCompactionMiddleware(backend=sandbox_backend),
+        # 13. 上下文摘要：工具结果累计超 token 预算（或 4 轮兜底）→ 压成一段结论
+        ContextSummarizerMiddleware(model=SUMMARY_MODEL),
         # 10. 调用限制（主 Agent）
         #
         # ⚠️ 2026-11-10 收紧：50/200 → 20/40，并补上 thread_limit。
