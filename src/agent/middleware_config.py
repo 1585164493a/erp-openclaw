@@ -22,6 +22,7 @@ from langchain.agents.middleware import (
 
 from agent.middlewares.tool_loop_guard import ToolLoopGuardMiddleware
 from agent.middlewares.tool_rollback import ToolRollbackMiddleware
+from agent.context_profile import get_profile
 from agent.middlewares.context_compaction import ToolResultCompactionMiddleware
 from agent.middlewares.context_summary import ContextSummarizerMiddleware
 
@@ -77,8 +78,8 @@ def create_analyst_middleware(model, backend) -> list:
         ToolCallLimitMiddleware(run_limit=60),
         ToolLoopGuardMiddleware(),          # 同名同参反复调用 → 降级/熔断
         ToolRollbackMiddleware(backend=backend),   # 写操作失败 → 逆序补偿
-        ToolResultCompactionMiddleware(backend=backend),  # 日志压缩 + 大结果下沉
-        ContextSummarizerMiddleware(model=model),          # token 预算 + 轮数兜底 → 摘要
+        ToolResultCompactionMiddleware(backend=backend, profile=get_profile()),  # 日志压缩 + 大结果下沉
+        ContextSummarizerMiddleware(model=model, profile=get_profile()),          # token 预算 + 轮数兜底 → 摘要
     ]
     if os.getenv("AB_DISABLE_TOOLS_SUMMARIZATION") == "1":
         return limits
@@ -102,8 +103,8 @@ def create_write_middleware(model=None, backend=None) -> list:
         ToolCallLimitMiddleware(run_limit=50),
         ToolLoopGuardMiddleware(),          # 写操作尤其怕反复打扰审批
         ToolRollbackMiddleware(backend=backend),   # 写失败 → 逆序补偿，不再走审批
-        ToolResultCompactionMiddleware(backend=backend),  # 日志压缩 + 大结果下沉
-        ContextSummarizerMiddleware(model=model),          # token 预算 + 轮数兜底 → 摘要
+        ToolResultCompactionMiddleware(backend=backend, profile=get_profile()),  # 日志压缩 + 大结果下沉
+        ContextSummarizerMiddleware(model=model, profile=get_profile()),          # token 预算 + 轮数兜底 → 摘要
     ]
 
 

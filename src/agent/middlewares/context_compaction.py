@@ -155,22 +155,27 @@ def sink_to_file(backend: Any, text: str, tool_name: str, timeout_s: float = 6.0
         return None
 
 
-def compact(text: str, tool_name: str, backend: Any) -> str:
-    """统一入口：日志压缩 → 仍然过大则下沉（保留头尾 + 可读回路径）。"""
-    if not text or not is_large(text):
+def compact(text: str, tool_name: str, backend: Any, profile: Any = None) -> str:
+    """统一入口：日志压缩 → 仍然过大则下沉（保留头尾 + 可读回路径）。
+
+    profile 为空时用模块常量（向后兼容）；传 ContextProfile 则按档位走。
+    """
+    if not text or not _is_large_with(text, profile):
         return text
 
     squeezed = compress_logs(text)
-    if not is_large(squeezed):
+    if not _is_large_with(squeezed, profile):
         saved = len(text) - len(squeezed)
         return f"{squeezed}\n\n【{MARKER}】已压缩掉约 {saved} 字符（时间戳/重复行/堆栈噪声）"
 
     lines = _lines(squeezed)
     path = sink_to_file(backend, squeezed, tool_name)
+    head_n = getattr(profile, "head_lines", HEAD_LINES) if profile else HEAD_LINES
+    tail_n = getattr(profile, "tail_lines", TAIL_LINES) if profile else TAIL_LINES
     # 逐行裁剪：JSON/单行大文本按"行"截没用（一行就是全部），必须按字符裁
     clipped = [l[:210] + ("…" if len(l) > 210 else "") for l in lines]
-    head = "\n".join(clipped[:HEAD_LINES])
-    tail = "\n".join(clipped[-TAIL_LINES:]) if len(lines) > HEAD_LINES + TAIL_LINES else ""
+    head = "\n".join(clipped[:head_n])
+    tail = "\n".join(clipped[-tail_n:]) if len(lines) > head_n + tail_n else ""
     note = (
         f"\n\n{SINK_MARK} 共 {len(lines)} 行，只显示头尾。"
         + (f"完整内容：`{path}`（read_file 可读）" if path
@@ -180,17 +185,26 @@ def compact(text: str, tool_name: str, backend: Any) -> str:
     return body + note
 
 
+def _is_large_with(text: str, profile: Any = None) -> bool:
+    """按档位判断是否"大结果"；无档位时用模块默认阈值。"""
+    max_lines = getattr(profile, "sink_lines", MAX_LINES) if profile else MAX_LINES
+    max_chars = getattr(profile, "sink_chars", MAX_CHARS) if profile else MAX_CHARS
+    return len(_lines(text)) > max_lines or len(text) > max_chars
+
+
 class ToolResultCompactionMiddleware(AgentMiddleware):
     """工具返回后统一压缩：日志正则 → 仍大则下沉到可读目录。"""
 
-    def __init__(self, backend: Any = None) -> None:
+    def __init__(self, backend: Any = None, profile: Any = None) -> None:
         super().__init__()
         self.backend = backend
+        self.profile = profile
+
     def _post(self, result: Any, tool_name: str) -> Any:
         content = getattr(result, "content", None)
         if not isinstance(content, str):
             return result
-        new = compact(content, tool_name, self.backend)
+        new = compact(content, tool_name, self.backend, self.profile)
         if new == content:
             return result
         return ToolMessage(

@@ -99,15 +99,30 @@ class ContextSummarizerMiddleware(AgentMiddleware):
     """工具结果累计超预算（或轮数兜底）时，把老结果摘成一段。"""
 
     def __init__(self, model: Any = None,
-                 tool_budget_tokens: int = TOOL_BUDGET_TOKENS,
-                 max_rounds: int = MAX_ROUNDS_SINCE_SUMMARY,
-                 keep_recent: int = KEEP_RECENT_RESULTS,
-                 keep_rounds: int = KEEP_RECENT_ROUNDS) -> None:
+                 tool_budget_tokens: int | None = None,
+                 max_rounds: int | None = None,
+                 keep_recent: int | None = None,
+                 keep_rounds: int = KEEP_RECENT_ROUNDS,
+                 profile: Any = None) -> None:
         super().__init__()
         self.model = model
-        self.tool_budget_tokens = tool_budget_tokens
-        self.max_rounds = max_rounds
-        self.keep_recent = keep_recent
+        self.profile = profile
+        # 档位优先，其次显式参数，最后模块默认
+        self.tool_budget_tokens = (
+            tool_budget_tokens
+            if tool_budget_tokens is not None
+            else (getattr(profile, "tool_budget_tokens", TOOL_BUDGET_TOKENS) if profile else TOOL_BUDGET_TOKENS)
+        )
+        self.max_rounds = (
+            max_rounds
+            if max_rounds is not None
+            else (getattr(profile, "max_rounds", MAX_ROUNDS_SINCE_SUMMARY) if profile else MAX_ROUNDS_SINCE_SUMMARY)
+        )
+        self.keep_recent = (
+            keep_recent
+            if keep_recent is not None
+            else (getattr(profile, "keep_recent_results", KEEP_RECENT_RESULTS) if profile else KEEP_RECENT_RESULTS)
+        )
         self.keep_rounds = keep_rounds
         self._rounds_since_summary = 0
 
