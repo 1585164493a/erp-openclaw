@@ -117,18 +117,41 @@ def compress_logs(text: str, keep_signal: int = 40) -> str:
     return result if len(result) < len(text) else text
 
 
-def sink_to_file(backend: Any, text: str, tool_name: str) -> str | None:
-    """把完整结果写进沙箱 /analysis/scratch/，返回**沙箱内可读**的路径。"""
+def sink_to_file(backend: Any, text: str, tool_name: str, timeout_s: float = 6.0) -> str | None:
+    """把完整结果写进沙箱 /analysis/scratch/，返回**沙箱内可读**的路径。
+
+    ⚠️ 超时保护（2026-11-12 事故）：沙箱慢/半死时 `backend.execute` 是**同步阻塞**调用，
+    没有超时会把事件循环卡死 —— 现象是 SSE 无输出、trace 停在上一个 span、整轮十几分钟不动。
+    这里用线程 + 超时兜住：超时就放弃下沉，只做纯截断，绝不拖住主流程。
+    """
     if backend is None:
         return None
     ts = time.strftime("%Y%m%d_%H%M%S")
     safe = re.sub(r"[^A-Za-z0-9_]+", "_", tool_name or "tool")[:40]
     path = f"{SCRATCH_DIR}/{safe}_{ts}.txt"
-    try:
+
+    def _do() -> str:
         backend.execute(f"mkdir -p {SCRATCH_DIR}")
         backend.upload_files([(path, text.encode("utf-8", "replace"))])
         return path
-    except Exception:  # noqa: BLE001 —— 落盘失败就只做纯截断
+
+    pool = None
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+
+        pool = ThreadPoolExecutor(max_workers=1)
+        fut = pool.submit(_do)
+        path_out = fut.result(timeout=timeout_s)
+        pool.shutdown(wait=False)
+        return path_out
+    except Exception:  # noqa: BLE001 —— 超时/失败都降级为纯截断
+        # 注意：不能用 with ThreadPoolExecutor(...)，它退出时会 wait=True 等线程跑完，
+        # 超时形同虚设（实测仍阻塞 30s）。这里显式 shutdown(wait=False) 立即返回。
+        if pool is not None:
+            try:
+                pool.shutdown(wait=False)
+            except Exception:  # noqa: BLE001
+                pass
         return None
 
 
@@ -184,7 +207,10 @@ class ToolResultCompactionMiddleware(AgentMiddleware):
     async def awrap_tool_call(self, request: Any, handler: Any) -> Any:
         tool_call = getattr(request, "tool_call", {}) or {}
         result = await handler(request)
-        return self._post(result, tool_call.get("name") or "")
+        # 压缩里含沙箱 IO（同步阻塞），放到线程里跑，绝不占用事件循环
+        import asyncio
+
+        return await asyncio.to_thread(self._post, result, tool_call.get("name") or "")
 
 # 注：逐条折叠方案已废弃（2026-11-12），改用 context_summary.ContextSummarizerMiddleware
 # —— 折叠只砍字符、语义找不回；摘要能把多条结果压成带口径的一段结论。

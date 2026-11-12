@@ -69,6 +69,10 @@ class SkillsSyncMiddleware(AgentMiddleware):
 
     # --------------------- 钩子 ---------------------
     def before_agent(self, state: Dict[str, Any], runtime: Any) -> Optional[Dict[str, Any]]:
+        # 延迟沙箱：还没创建过就跳过同步 —— 否则每次请求都会为"同步技能"提前拉沙箱，
+        # 纯问答（"你好"）也要等 45~90 秒。
+        if hasattr(self.backend, "is_bound") and not self.backend.is_bound():
+            return None
         new_skills = self._sync_files()
         if new_skills:
             return self._make_notification(new_skills)
@@ -76,6 +80,8 @@ class SkillsSyncMiddleware(AgentMiddleware):
 
     async def abefore_agent(self, state: Dict[str, Any], runtime: Any) -> Optional[Dict[str, Any]]:
         import asyncio
+        if hasattr(self.backend, "is_bound") and not self.backend.is_bound():
+            return None
         loop = asyncio.get_running_loop()
         new_skills = await loop.run_in_executor(None, self._sync_files)
         if new_skills:

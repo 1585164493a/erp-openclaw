@@ -10,9 +10,10 @@ questions:
 
   - id: H01
     category: window_topn
-    question: "每个品类里销量最高的商品是哪个？"
+    question: "按全部数据（sales_daily 全量，不限定时间窗口）统计，每个品类里销量最高的商品是哪个？"
     judge: exec
     ground_truth_sql: "select t.product_code from (select p.category, p.product_code, row_number() over (partition by p.category order by sum(d.quantity) desc) rn from sales_daily d join product p on p.id=d.product_id where d.deleted=0 and p.deleted=0 group by p.category, p.product_code) t where t.rn=1"
+    note: "2026-11-12 修正：题目原来没写窗口，agent 按近 30 天算也合理（与全量口径有 4 个品类不同），补上'全部数据'"
 
   - id: H02
     category: share

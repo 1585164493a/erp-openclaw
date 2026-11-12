@@ -102,7 +102,10 @@ def ask_agent(question: str, timeout: float = 600.0) -> dict:
 
     try:
         with httpx.Client(
-            timeout=httpx.Timeout(connect=15.0, read=None, write=30.0, pool=15.0)
+            # read 设成 timeout+30：卡死时能被 ReadTimeout 打断。
+            # 之前是 read=None（永不超时），结果 SSE 流卡住时整轮挂 16 分钟，
+            # 外层 deadline 也轮不到执行（它只在"收到下一行"时才检查）。
+            timeout=httpx.Timeout(connect=15.0, read=timeout + 30.0, write=30.0, pool=15.0)
         ) as client:
             with client.stream("POST", f"{BASE_URL}/api/chat/stream", json=payload) as resp:
                 if resp.status_code != 200:

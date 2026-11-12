@@ -182,10 +182,38 @@ async def ensure_sandbox_for_user(user_id: str) -> SandboxBackendProxy:
     return await _create_sandbox_for_user(user_id)
 
 
+def get_lazy_proxy(user_id: str) -> SandboxBackendProxy:
+    """返回一个**延迟创建**的沙箱代理：只有真正用到沙箱时才分配（2026-11-12）。
+
+    为什么需要：以前每次请求都 `ensure_sandbox_for_user`，连"你好"也要等 45~90 秒建沙箱。
+    现在建图时只拿到这个空代理；第一次 execute/read_file/py_exec 时才在里面
+    同步调用 `ensure_sandbox_for_user`（丢到独立线程跑，避免和事件循环冲突）。
+    """
+    from agent.backends.sandbox_proxy import SandboxBackendProxy
+
+    existing = SANDBOX_BACKENDS.get(user_id)
+    if existing is not None and getattr(existing, "is_bound", lambda: True)():
+        return existing
+
+    def _factory() -> SandboxBackendProxy:  # 同步工厂：内部起线程跑 async 的 ensure
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _run() -> SandboxBackendProxy:
+            return asyncio.run(ensure_sandbox_for_user(user_id))
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(_run).result()
+
+    proxy = SandboxBackendProxy(backend=None, factory=_factory)
+    SANDBOX_BACKENDS[user_id] = proxy
+    logger.info("用户 %s 使用延迟沙箱代理（首次用到沙箱时才创建）", user_id)
+    return proxy
+
+
 async def ping_user_sandbox(user_id: str) -> bool:
     """公开的沙箱健康检查，供中间件调用。"""
     proxy = SANDBOX_BACKENDS.get(user_id)
-    if proxy is None:
+    if proxy is None or not getattr(proxy, "is_bound", lambda: True)():
         return False
     try:
         await asyncio.to_thread(proxy.execute, "echo ok")

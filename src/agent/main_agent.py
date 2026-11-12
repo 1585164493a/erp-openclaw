@@ -230,10 +230,18 @@ async def create_main_agent(
             },
         )
 
-    # ---- Phase 1.4: 上传 AGENTS.md 到沙箱 ----
-    logger.info("Phase 1.4: 上传 AGENTS.md 到沙箱...")
+    # ---- Phase 1.4: AGENTS.md ----
+    # 2026-11-12 改动：**不再把 AGENTS.md 当沙箱文件读**。
+    # 以前 `memory=["/AGENTS.md"]` 让每次建图都要读沙箱 → 连"你好"都得先建沙箱（45~90s）。
+    # AGENTS.md 是本地静态文本，直接拼进 system prompt 即可；沙箱里那份由 sandbox_setup
+    # 播种（子 Agent 读文件时用得到），与本处解耦。
+    logger.info("Phase 1.4: 加载 AGENTS.md（拼进 system prompt，不经过沙箱）...")
     ag_md_content = LOCAL_AGENTS_MD.read_text(encoding="utf-8")
-    sandbox_backend.upload_files([("/AGENTS.md", ag_md_content.encode("utf-8"))])
+    if getattr(sandbox_backend, "is_bound", lambda: True)():
+        try:
+            sandbox_backend.upload_files([("/AGENTS.md", ag_md_content.encode("utf-8"))])
+        except Exception as exc:  # noqa: BLE001 —— 沙箱不可用时不该拖垮建图
+            logger.warning("上传 /AGENTS.md 到沙箱失败（忽略）: %s", exc)
 
     # ---- Phase 2/3/5: 使用预计算结果 ----
     logger.info("Phase 2-5: 使用预计算的 MCP 工具 + 图表工具 + YAML 配置...")
@@ -377,9 +385,8 @@ async def create_main_agent(
         logger.warning("登记默认补偿函数失败: %s", exc)
     agent_graph = create_deep_agent(
         model=MAIN_MODEL,
-        system_prompt=system_prompt,
+        system_prompt=system_prompt + "\n\n---\n\n" + ag_md_content,
         skills=["/skills/main/"],
-        memory=[AGENTS_MD_FILENAME],
         tools=[web_search, assign_skill, download_sandbox_file,
                py_exec, py_reset, request_clarification],
         subagents=subagents,

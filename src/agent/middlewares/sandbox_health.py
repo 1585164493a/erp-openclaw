@@ -59,6 +59,10 @@ class SandboxHealthMiddleware(AgentMiddleware):
         return None
 
     async def _check(self) -> bool:
+        # 延迟沙箱：还没创建过就不要 ping —— 否则每次请求都会把它提前拉起来，
+        # 纯问答（"你好"）也会白等 45~90 秒建沙箱。
+        if hasattr(self._backend, "is_bound") and not self._backend.is_bound():
+            return True
         try:
             await asyncio.to_thread(self._backend.execute, "echo ok")
             return True

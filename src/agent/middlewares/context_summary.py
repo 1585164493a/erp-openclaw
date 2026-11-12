@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Any
 
@@ -61,6 +62,37 @@ _SUMMARY_PROMPT = (
     "4. 若某次查询报错或无结果，写清楚是哪个查询、报什么错。\n"
     f"不要保留：原始表格、重复行、寒暄。控制在 {SUMMARY_MAX_CHARS} 字以内。\n\n"
 )
+
+
+# 摘要调用的硬超时：模型卡住时宁可不要摘要，也不能拖死整轮
+DIGEST_TIMEOUT_S = 25.0
+
+
+def _fallback(texts: list[str]) -> str:
+    joined = "\n".join(t[:300] for t in texts)
+    return f"（摘要不可用，以下是各结果开头）\n{joined}"[: SUMMARY_MAX_CHARS * 3]
+
+
+def _with_timeout(fn, fallback: str, timeout_s: float = DIGEST_TIMEOUT_S) -> str:
+    """在线程里跑 fn，超时立即返回 fallback。
+
+    注意不能用 `with ThreadPoolExecutor(...)`：退出时会 wait=True 等线程跑完，超时形同虚设。
+    """
+    pool = None
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+
+        pool = ThreadPoolExecutor(max_workers=1)
+        out = pool.submit(fn).result(timeout=timeout_s)
+        pool.shutdown(wait=False)
+        return out
+    except Exception:  # noqa: BLE001
+        if pool is not None:
+            try:
+                pool.shutdown(wait=False)
+            except Exception:  # noqa: BLE001
+                pass
+        return fallback
 
 
 class ContextSummarizerMiddleware(AgentMiddleware):
@@ -113,28 +145,28 @@ class ContextSummarizerMiddleware(AgentMiddleware):
 
     # ---------- 摘要 ----------
     def _digest(self, texts: list[str]) -> str:
-        body = "\n\n".join(f"[结果 {i + 1}] {t[:4000]}" for i, t in enumerate(texts))
+        body = "\n\n".join(f"[结果 {i + 1}] {t[:1200]}" for i, t in enumerate(texts))
         prompt = _SUMMARY_PROMPT + body
-        try:
-            resp = self.model.invoke([HumanMessage(content=prompt)])
-            out = getattr(resp, "content", None) or str(resp)
-            out = out if isinstance(out, str) else str(out)
-            return out.strip()[: SUMMARY_MAX_CHARS * 3]
-        except Exception as e:  # noqa: BLE001 —— 摘要失败就降级为硬截断，不能阻塞主流程
-            joined = "\n".join(t[:400] for t in texts)
-            return f"（摘要失败：{e.__class__.__name__}，以下是各结果开头）\n{joined}"[: SUMMARY_MAX_CHARS * 3]
+        return _with_timeout(lambda: self._call_model(prompt), fallback=_fallback(texts))
 
     async def _adigest(self, texts: list[str]) -> str:
-        body = "\n\n".join(f"[结果 {i + 1}] {t[:4000]}" for i, t in enumerate(texts))
+        body = "\n\n".join(f"[结果 {i + 1}] {t[:1200]}" for i, t in enumerate(texts))
         prompt = _SUMMARY_PROMPT + body
+        # 异步路径直接 await，但给整体加超时，避免模型卡住拖死整轮
         try:
-            resp = await self.model.ainvoke([HumanMessage(content=prompt)])
-            out = getattr(resp, "content", None) or str(resp)
-            out = out if isinstance(out, str) else str(out)
-            return out.strip()[: SUMMARY_MAX_CHARS * 3]
-        except Exception as e:  # noqa: BLE001
-            joined = "\n".join(t[:400] for t in texts)
-            return f"（摘要失败：{e.__class__.__name__}，以下是各结果开头）\n{joined}"[: SUMMARY_MAX_CHARS * 3]
+            return await asyncio.wait_for(self._acall_model(prompt), timeout=DIGEST_TIMEOUT_S)
+        except Exception:  # noqa: BLE001
+            return _fallback(texts)
+
+    def _call_model(self, prompt: str) -> str:
+        resp = self.model.invoke([HumanMessage(content=prompt)])
+        out = getattr(resp, "content", None) or str(resp)
+        return (out if isinstance(out, str) else str(out)).strip()[: SUMMARY_MAX_CHARS * 3]
+
+    async def _acall_model(self, prompt: str) -> str:
+        resp = await self.model.ainvoke([HumanMessage(content=prompt)])
+        out = getattr(resp, "content", None) or str(resp)
+        return (out if isinstance(out, str) else str(out)).strip()[: SUMMARY_MAX_CHARS * 3]
 
     def _apply(self, messages: list, idx: list[int], digest: str) -> dict[str, Any]:
         fresh = list(messages)

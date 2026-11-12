@@ -112,7 +112,9 @@ class AgentLoader:
         Returns:
             CompiledStateGraph: 该用户的 agent graph。
         """
-        sandbox_backend = await sandbox_manager.ensure_sandbox_for_user(user_id)
+        # 延迟分配（2026-11-12）：建图不再等沙箱，只有真正用到沙箱时才创建。
+        # 纯问答（"你好""什么是安全库存"）因此完全不占沙箱、不用等 45~90 秒。
+        sandbox_backend = sandbox_manager.get_lazy_proxy(user_id)
         # 只需要 user_id 用于建图；无需 thread_id（create_config 已带上 user_id）
         config = self.create_config(user_id=user_id)
         agent_graph = await create_main_agent(
