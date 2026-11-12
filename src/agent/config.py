@@ -72,6 +72,12 @@ SANDBOX_ANALYSIS_ROOT = "/analysis"
 SANDBOX_DATA_ROOT = "/data"
 # 本地技能资源目录（项目内的路径，相对于项目根）
 LOCAL_SKILLS_DIR = EXAMPLE_DIR / "skills"
+
+# ---------- 知识库（Wiki）：结构化业务知识，按需读取 ----------
+# 放法：本地 knowledge/ → 沙箱 /knowledge/
+# 读法：渐进披露 —— 先读 /knowledge/index.md（目录+触发条件），再按需读 1~2 篇
+SANDBOX_KNOWLEDGE_ROOT = "/knowledge"
+LOCAL_KNOWLEDGE_DIR = EXAMPLE_DIR.parent / "knowledge"
 # 本地下载目录（从沙箱下载文件的目标路径）
 DOWNLOAD_DIR = EXAMPLE_DIR / "download"
 # 本地子 Agent 配置目录

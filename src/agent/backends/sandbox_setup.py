@@ -20,7 +20,8 @@ from opensandbox import SandboxSync
 
 from agent.backends.custom_opensandbox import OpenSandboxBackend
 from agent.config import (
-    LOCAL_SKILLS_DIR, SANDBOX_SKILLS_ROOT,
+    LOCAL_KNOWLEDGE_DIR, LOCAL_SKILLS_DIR, SANDBOX_KNOWLEDGE_ROOT,
+    SANDBOX_SKILLS_ROOT,
 )
 
 
@@ -317,6 +318,15 @@ def _seed_files(backend: OpenSandboxBackend) -> None:
                     rel = local_file.relative_to(skills_base).as_posix()
                     sandbox_path = f"{SANDBOX_SKILLS_ROOT}/{rel}"
                     file_mapping.append((local_file, sandbox_path))
+
+    # 播种业务知识库（Wiki）：index.md / schema.md / metrics.md / traps.md / examples/*
+    # 渐进披露用：模型先读 /knowledge/index.md，再按需读 1~2 篇
+    knowledge_base = Path(LOCAL_KNOWLEDGE_DIR)
+    if knowledge_base.exists():
+        for local_file in knowledge_base.rglob("*"):
+            if local_file.is_file() and local_file.suffix in {".md", ".sql", ".yaml"}:
+                rel = local_file.relative_to(knowledge_base).as_posix()
+                file_mapping.append((local_file, f"{SANDBOX_KNOWLEDGE_ROOT}/{rel}"))
 
     # 收集需要上传的文件
     to_upload: List[Tuple[str, bytes]] = []
